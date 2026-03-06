@@ -74,6 +74,10 @@ pub struct MarkdownStyle {
     pub selection_background_color: Hsla,
     pub heading: StyleRefinement,
     pub heading_level_styles: Option<HeadingLevelStyles>,
+    pub list_marker_color: Hsla,
+    pub strong: TextStyleRefinement,
+    pub emphasis: TextStyleRefinement,
+    pub strikethrough: TextStyleRefinement,
     pub height_is_multiple_of_line_height: bool,
     pub prevent_mouse_interaction: bool,
     pub table_columns_min_size: bool,
@@ -96,6 +100,10 @@ impl Default for MarkdownStyle {
             selection_background_color: Default::default(),
             heading: Default::default(),
             heading_level_styles: None,
+            list_marker_color: Default::default(),
+            strong: Default::default(),
+            emphasis: Default::default(),
+            strikethrough: Default::default(),
             height_is_multiple_of_line_height: false,
             prevent_mouse_interaction: false,
             table_columns_min_size: false,
@@ -140,34 +148,86 @@ impl MarkdownStyle {
             ..Default::default()
         });
 
+        // Get heading style from syntax theme
+        let syntax = cx.theme().syntax();
+        let heading_highlight = syntax.get_opt("title");
+
         MarkdownStyle {
             base_text_style: text_style.clone(),
-            syntax: cx.theme().syntax().clone(),
+            syntax: syntax.clone(),
             selection_background_color: colors.element_selection_background,
             code_block_overflow_x_scroll: true,
             heading_level_styles: Some(HeadingLevelStyles {
                 h1: Some(TextStyleRefinement {
                     font_size: Some(rems(1.15).into()),
+                    font_weight: heading_highlight
+                        .and_then(|s| s.font_weight)
+                        .or(Some(FontWeight::BOLD)),
+                    color: heading_highlight
+                        .and_then(|s| s.color)
+                        .or(Some(colors.text_accent)),
+                    font_style: heading_highlight.and_then(|s| s.font_style),
+                    background_color: heading_highlight.and_then(|s| s.background_color),
                     ..Default::default()
                 }),
                 h2: Some(TextStyleRefinement {
                     font_size: Some(rems(1.1).into()),
+                    font_weight: heading_highlight
+                        .and_then(|s| s.font_weight)
+                        .or(Some(FontWeight::BOLD)),
+                    color: heading_highlight
+                        .and_then(|s| s.color)
+                        .or(Some(colors.text_accent)),
+                    font_style: heading_highlight.and_then(|s| s.font_style),
+                    background_color: heading_highlight.and_then(|s| s.background_color),
                     ..Default::default()
                 }),
                 h3: Some(TextStyleRefinement {
                     font_size: Some(rems(1.05).into()),
+                    font_weight: heading_highlight
+                        .and_then(|s| s.font_weight)
+                        .or(Some(FontWeight::SEMIBOLD)),
+                    color: heading_highlight
+                        .and_then(|s| s.color)
+                        .or(Some(colors.text_accent)),
+                    font_style: heading_highlight.and_then(|s| s.font_style),
+                    background_color: heading_highlight.and_then(|s| s.background_color),
                     ..Default::default()
                 }),
                 h4: Some(TextStyleRefinement {
                     font_size: Some(rems(1.).into()),
+                    font_weight: heading_highlight
+                        .and_then(|s| s.font_weight)
+                        .or(Some(FontWeight::SEMIBOLD)),
+                    color: heading_highlight
+                        .and_then(|s| s.color)
+                        .or(Some(colors.text_accent)),
+                    font_style: heading_highlight.and_then(|s| s.font_style),
+                    background_color: heading_highlight.and_then(|s| s.background_color),
                     ..Default::default()
                 }),
                 h5: Some(TextStyleRefinement {
                     font_size: Some(rems(0.95).into()),
+                    font_weight: heading_highlight
+                        .and_then(|s| s.font_weight)
+                        .or(Some(FontWeight::MEDIUM)),
+                    color: heading_highlight
+                        .and_then(|s| s.color)
+                        .or(Some(colors.text_accent)),
+                    font_style: heading_highlight.and_then(|s| s.font_style),
+                    background_color: heading_highlight.and_then(|s| s.background_color),
                     ..Default::default()
                 }),
                 h6: Some(TextStyleRefinement {
                     font_size: Some(rems(0.875).into()),
+                    font_weight: heading_highlight
+                        .and_then(|s| s.font_weight)
+                        .or(Some(FontWeight::MEDIUM)),
+                    color: heading_highlight
+                        .and_then(|s| s.color)
+                        .or(Some(colors.text_accent)),
+                    font_style: heading_highlight.and_then(|s| s.font_style),
+                    background_color: heading_highlight.and_then(|s| s.background_color),
                     ..Default::default()
                 }),
             }),
@@ -203,24 +263,123 @@ impl MarkdownStyle {
                 },
                 ..Default::default()
             },
-            inline_code: TextStyleRefinement {
-                font_family: Some(theme_settings.buffer_font.family.clone()),
-                font_fallbacks: theme_settings.buffer_font.fallbacks.clone(),
-                font_features: Some(theme_settings.buffer_font.features.clone()),
-                font_size: Some(buffer_font_size.into()),
-                font_weight: Some(buffer_font_weight),
-                background_color: Some(colors.editor_foreground.opacity(0.08)),
-                ..Default::default()
-            },
-            link: TextStyleRefinement {
-                background_color: Some(colors.editor_foreground.opacity(0.025)),
-                color: Some(colors.text_accent),
-                underline: Some(UnderlineStyle {
-                    color: Some(colors.text_accent.opacity(0.5)),
-                    thickness: px(1.),
+            inline_code: {
+                let mut style = TextStyleRefinement {
+                    font_family: Some(theme_settings.buffer_font.family.clone()),
+                    font_fallbacks: theme_settings.buffer_font.fallbacks.clone(),
+                    font_features: Some(theme_settings.buffer_font.features.clone()),
+                    font_size: Some(buffer_font_size.into()),
                     ..Default::default()
-                }),
-                ..Default::default()
+                };
+
+                if let Some(highlight) = syntax.get_opt("text.literal") {
+                    style.color = highlight.color.or(Some(colors.text_accent));
+                    style.background_color = highlight.background_color.or(Some(colors.editor_foreground.opacity(0.08)));
+                    style.font_weight = highlight.font_weight.or(Some(buffer_font_weight));
+                    style.font_style = highlight.font_style;
+                } else {
+                    style.color = Some(colors.text_accent);
+                    style.background_color = Some(colors.editor_foreground.opacity(0.08));
+                    style.font_weight = Some(buffer_font_weight);
+                }
+
+                style
+            },
+            link: {
+                let link_highlight = syntax.get_opt("link_text");
+                let url_highlight = syntax.get_opt("link_uri");
+
+                TextStyleRefinement {
+                    color: link_highlight
+                        .and_then(|s| s.color)
+                        .or(Some(colors.text_accent)),
+                    background_color: link_highlight
+                        .and_then(|s| s.background_color)
+                        .or(Some(colors.editor_foreground.opacity(0.025))),
+                    font_weight: link_highlight.and_then(|s| s.font_weight),
+                    font_style: link_highlight.and_then(|s| s.font_style),
+                    underline: url_highlight
+                        .and_then(|s| s.underline)
+                        .or_else(|| Some(UnderlineStyle {
+                            color: url_highlight
+                                .and_then(|s| s.color)
+                                .or(Some(colors.text_accent.opacity(0.5))),
+                            thickness: px(1.),
+                            ..Default::default()
+                        })),
+                    ..Default::default()
+                }
+            },
+            block_quote: {
+                let quote_highlight = syntax.get_opt("punctuation.markup");
+
+                TextStyleRefinement {
+                    color: quote_highlight
+                        .and_then(|s| s.color)
+                        .or(Some(colors.text_muted)),
+                    background_color: quote_highlight.and_then(|s| s.background_color),
+                    font_style: quote_highlight.and_then(|s| s.font_style),
+                    font_weight: quote_highlight.and_then(|s| s.font_weight),
+                    ..Default::default()
+                }
+            },
+            rule_color: syntax.get_opt("punctuation.markup")
+                .and_then(|s| s.color)
+                .unwrap_or(colors.border),
+            block_quote_border_color: syntax.get_opt("punctuation.markup")
+                .and_then(|s| s.color)
+                .unwrap_or(colors.border_variant),
+            list_marker_color: syntax.get_opt("punctuation.list_marker")
+                .and_then(|style| style.color)
+                .or_else(|| heading_highlight.and_then(|s| s.color))
+                .unwrap_or(colors.text_accent),
+            strong: {
+                let bold_highlight = syntax.get_opt("emphasis.strong");
+
+                TextStyleRefinement {
+                    font_weight: bold_highlight
+                        .and_then(|s| s.font_weight)
+                        .or(Some(FontWeight::BOLD)),
+                    color: bold_highlight
+                        .and_then(|s| s.color)
+                        .or(Some(colors.text)),
+                    background_color: bold_highlight.and_then(|s| s.background_color),
+                    font_style: bold_highlight.and_then(|s| s.font_style),
+                    ..Default::default()
+                }
+            },
+            emphasis: {
+                let italic_highlight = syntax.get_opt("emphasis");
+
+                TextStyleRefinement {
+                    font_style: italic_highlight
+                        .and_then(|s| s.font_style)
+                        .or(Some(FontStyle::Italic)),
+                    color: italic_highlight.and_then(|s| s.color),
+                    background_color: italic_highlight.and_then(|s| s.background_color),
+                    font_weight: italic_highlight.and_then(|s| s.font_weight),
+                    ..Default::default()
+                }
+            },
+            strikethrough: {
+                // Note: "strikethrough" token doesn't exist in themes, fallback to punctuation.markup
+                let strikethrough_highlight = syntax.get_opt("punctuation.markup");
+
+                TextStyleRefinement {
+                    strikethrough: strikethrough_highlight
+                        .and_then(|s| s.strikethrough)
+                        .or_else(|| Some(StrikethroughStyle {
+                            thickness: px(1.),
+                            color: strikethrough_highlight.and_then(|s| s.color),
+                        })),
+                    color: strikethrough_highlight
+                        .and_then(|s| s.color)
+                        .or(Some(colors.text_muted)),
+                    background_color: strikethrough_highlight.and_then(|s| s.background_color),
+                    font_weight: strikethrough_highlight.and_then(|s| s.font_weight),
+                    font_style: strikethrough_highlight.and_then(|s| s.font_style),
+                    ..Default::default()
+                }
             },
             ..Default::default()
         }
@@ -1095,7 +1254,20 @@ impl Element for MarkdownElement {
 
                             heading.style().refine(&self.style.heading);
 
-                            let text_style = self.style.heading.text_style().clone();
+                            // Get text style from heading_level_styles if available
+                            let text_style = if let Some(styles) = &self.style.heading_level_styles {
+                                let style_opt = match level {
+                                    pulldown_cmark::HeadingLevel::H1 => &styles.h1,
+                                    pulldown_cmark::HeadingLevel::H2 => &styles.h2,
+                                    pulldown_cmark::HeadingLevel::H3 => &styles.h3,
+                                    pulldown_cmark::HeadingLevel::H4 => &styles.h4,
+                                    pulldown_cmark::HeadingLevel::H5 => &styles.h5,
+                                    pulldown_cmark::HeadingLevel::H6 => &styles.h6,
+                                };
+                                style_opt.clone().unwrap_or_default()
+                            } else {
+                                self.style.heading.text_style().clone()
+                            };
 
                             builder.push_text_style(text_style);
                             builder.push_div(heading, range, markdown_end);
@@ -1114,7 +1286,10 @@ impl Element for MarkdownElement {
                         }
                         MarkdownTag::CodeBlock { kind, .. } => {
                             let language = match kind {
-                                CodeBlockKind::Fenced => None,
+                                CodeBlockKind::Fenced => {
+                                    // Use fallback language for unnamed code blocks
+                                    parsed_markdown.languages_by_name.get(&"".into()).cloned()
+                                }
                                 CodeBlockKind::FencedLang(language) => {
                                     parsed_markdown.languages_by_name.get(language).cloned()
                                 }
@@ -1219,9 +1394,15 @@ impl Element for MarkdownElement {
                                 .visualization_only(true)
                                 .into_any_element()
                             } else if let Some(bullet_index) = builder.next_bullet_index() {
-                                div().child(format!("{}.", bullet_index)).into_any_element()
+                                div()
+                                    .text_color(self.style.list_marker_color)
+                                    .child(format!("{}.", bullet_index))
+                                    .into_any_element()
                             } else {
-                                div().child("•").into_any_element()
+                                div()
+                                    .text_color(self.style.list_marker_color)
+                                    .child("•")
+                                    .into_any_element()
                             };
                             builder.push_div(
                                 div()
@@ -1237,23 +1418,9 @@ impl Element for MarkdownElement {
                             // Without `w_0`, text doesn't wrap to the width of the container.
                             builder.push_div(div().flex_1().w_0(), range, markdown_end);
                         }
-                        MarkdownTag::Emphasis => builder.push_text_style(TextStyleRefinement {
-                            font_style: Some(FontStyle::Italic),
-                            ..Default::default()
-                        }),
-                        MarkdownTag::Strong => builder.push_text_style(TextStyleRefinement {
-                            font_weight: Some(FontWeight::BOLD),
-                            ..Default::default()
-                        }),
-                        MarkdownTag::Strikethrough => {
-                            builder.push_text_style(TextStyleRefinement {
-                                strikethrough: Some(StrikethroughStyle {
-                                    thickness: px(1.),
-                                    color: None,
-                                }),
-                                ..Default::default()
-                            })
-                        }
+                        MarkdownTag::Emphasis => builder.push_text_style(self.style.emphasis.clone()),
+                        MarkdownTag::Strong => builder.push_text_style(self.style.strong.clone()),
+                        MarkdownTag::Strikethrough => builder.push_text_style(self.style.strikethrough.clone()),
                         MarkdownTag::Link { dest_url, .. } => {
                             if builder.code_block_stack.is_empty() {
                                 builder.push_link(dest_url.clone(), range.clone());
@@ -1453,9 +1620,29 @@ impl Element for MarkdownElement {
                     builder.push_text(text, range.clone());
                 }
                 MarkdownEvent::Code => {
-                    builder.push_text_style(self.style.inline_code.clone());
-                    builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
-                    builder.pop_text_style();
+                    let code_text = &parsed_markdown.source[range.clone()];
+
+                    // Check if inline code looks like a file path using regex
+                    // Matches patterns like: path/to/file.ext or path/to/file.ext:10-20
+                    let is_file_path = code_text.contains('/') &&
+                        code_text.chars().any(|c| c == '.') &&
+                        !code_text.starts_with("http://") &&
+                        !code_text.starts_with("https://");
+
+                    if is_file_path {
+                        // Treat as file path link
+                        let path_with_range = PathWithRange::new(code_text);
+                        let file_url = format!("file://{}", path_with_range.path);
+                        builder.push_link(file_url.into(), range.clone());
+                        builder.push_text_style(self.style.link.clone());
+                        builder.push_text(code_text, range.clone());
+                        builder.pop_text_style();
+                    } else {
+                        // Regular inline code
+                        builder.push_text_style(self.style.inline_code.clone());
+                        builder.push_text(code_text, range.clone());
+                        builder.pop_text_style();
+                    }
                 }
                 MarkdownEvent::Html => {
                     let html = &parsed_markdown.source[range.clone()];

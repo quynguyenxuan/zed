@@ -12,7 +12,7 @@ use futures::{FutureExt, channel::oneshot, future::BoxFuture};
 use gpui::{AppContext, AsyncApp, Context, Entity, EventEmitter, SharedString, Task, WeakEntity};
 use itertools::Itertools;
 use language::language_settings::FormatOnSave;
-use language::{Anchor, Buffer, BufferSnapshot, LanguageRegistry, Point, ToPoint, text_diff};
+use language::{Anchor, Buffer, BufferSnapshot, LanguageName, LanguageRegistry, Point, ToPoint, text_diff};
 use markdown::Markdown;
 pub use mention::*;
 use project::lsp_store::{FormatTrigger, LspFormatTarget};
@@ -128,7 +128,11 @@ impl AssistantMessage {
 #[derive(Debug, PartialEq)]
 pub enum AssistantMessageChunk {
     Message { block: ContentBlock },
-    Thought { block: ContentBlock },
+    Thought {
+        block: ContentBlock,
+        started_at: Option<Instant>,
+        completed_at: Option<Instant>,
+    },
 }
 
 impl AssistantMessageChunk {
@@ -146,7 +150,7 @@ impl AssistantMessageChunk {
     fn to_markdown(&self, cx: &App) -> String {
         match self {
             Self::Message { block } => block.to_markdown(cx).to_string(),
-            Self::Thought { block } => {
+            Self::Thought { block, .. } => {
                 format!("<thinking>\n{}\n</thinking>", block.to_markdown(cx))
             }
         }
@@ -232,6 +236,10 @@ pub struct ToolCall {
     pub raw_output: Option<serde_json::Value>,
     pub tool_name: Option<SharedString>,
     pub subagent_session_info: Option<SubagentSessionInfo>,
+    /// When the tool call transitioned to InProgress status.
+    pub started_at: Option<Instant>,
+    /// When the tool call reached a terminal status (Completed, Failed, Rejected, Canceled).
+    pub completed_at: Option<Instant>,
 }
 
 impl ToolCall {
@@ -286,6 +294,8 @@ impl ToolCall {
             raw_output: tool_call.raw_output,
             tool_name,
             subagent_session_info,
+            started_at: None,
+            completed_at: None,
         };
         Ok(result)
     }
@@ -315,7 +325,24 @@ impl ToolCall {
         }
 
         if let Some(status) = status {
-            self.status = status.into();
+            let new_status: ToolCallStatus = status.into();
+            match &new_status {
+                ToolCallStatus::InProgress => {
+                    if self.started_at.is_none() {
+                        self.started_at = Some(Instant::now());
+                    }
+                }
+                ToolCallStatus::Completed
+                | ToolCallStatus::Failed
+                | ToolCallStatus::Rejected
+                | ToolCallStatus::Canceled => {
+                    if self.completed_at.is_none() {
+                        self.completed_at = Some(Instant::now());
+                    }
+                }
+                _ => {}
+            }
+            self.status = new_status;
         }
 
         if let Some(subagent_session_info) = subagent_session_info_from_meta(&meta) {
@@ -633,7 +660,7 @@ impl ContentBlock {
     ) -> ContentBlock {
         ContentBlock::Markdown {
             markdown: cx
-                .new(|cx| Markdown::new(content.into(), Some(language_registry.clone()), None, cx)),
+                .new(|cx| Markdown::new(content.into(), Some(language_registry.clone()), Some(LanguageName::new_static("Rust")), cx)),
         }
     }
 
@@ -883,14 +910,30 @@ pub struct PlanEntry {
     pub content: Entity<Markdown>,
     pub priority: acp::PlanEntryPriority,
     pub status: acp::PlanEntryStatus,
+    pub started_at: Option<Instant>,
+    pub completed_at: Option<Instant>,
 }
 
 impl PlanEntry {
     pub fn from_acp(entry: acp::PlanEntry, cx: &mut App) -> Self {
+        let now = Instant::now();
+        let started_at = if matches!(&entry.status, acp::PlanEntryStatus::InProgress) {
+            Some(now)
+        } else {
+            None
+        };
+        let completed_at = if matches!(&entry.status, acp::PlanEntryStatus::Completed) {
+            Some(now)
+        } else {
+            None
+        };
+
         Self {
             content: cx.new(|cx| Markdown::new(entry.content.into(), None, None, cx)),
             priority: entry.priority,
             status: entry.status,
+            started_at,
+            completed_at,
         }
     }
 }
@@ -1378,6 +1421,19 @@ impl AcpThread {
                 config_options,
                 ..
             }) => cx.emit(AcpThreadEvent::ConfigOptionsUpdated(config_options)),
+            acp::SessionUpdate::UsageUpdate(usage) => {
+                let existing = self.token_usage.as_ref();
+                self.update_token_usage(
+                    Some(TokenUsage {
+                        max_tokens: usage.size,
+                        used_tokens: usage.used.unwrap_or(0),
+                        input_tokens: existing.map_or(0, |u| u.input_tokens),
+                        output_tokens: existing.map_or(0, |u| u.output_tokens),
+                        max_output_tokens: existing.and_then(|u| u.max_output_tokens),
+                    }),
+                    cx,
+                );
+            }
             _ => {}
         }
         Ok(())
@@ -1463,14 +1519,21 @@ impl AcpThread {
             let idx = entries_len - 1;
             cx.emit(AcpThreadEvent::EntryUpdated(idx));
             match (chunks.last_mut(), is_thought) {
-                (Some(AssistantMessageChunk::Message { block }), false)
-                | (Some(AssistantMessageChunk::Thought { block }), true) => {
+                (Some(AssistantMessageChunk::Message { block }), false) => {
                     block.append(chunk, &language_registry, path_style, cx)
+                }
+                (Some(AssistantMessageChunk::Thought { block, completed_at, .. }), true) => {
+                    block.append(chunk, &language_registry, path_style, cx);
+                    *completed_at = Some(Instant::now());
                 }
                 _ => {
                     let block = ContentBlock::new(chunk, &language_registry, path_style, cx);
                     if is_thought {
-                        chunks.push(AssistantMessageChunk::Thought { block })
+                        chunks.push(AssistantMessageChunk::Thought {
+                            block,
+                            started_at: Some(Instant::now()),
+                            completed_at: Some(Instant::now()),
+                        })
                     } else {
                         chunks.push(AssistantMessageChunk::Message { block })
                     }
@@ -1479,7 +1542,11 @@ impl AcpThread {
         } else {
             let block = ContentBlock::new(chunk, &language_registry, path_style, cx);
             let chunk = if is_thought {
-                AssistantMessageChunk::Thought { block }
+                AssistantMessageChunk::Thought {
+                    block,
+                    started_at: Some(Instant::now()),
+                    completed_at: Some(Instant::now()),
+                }
             } else {
                 AssistantMessageChunk::Message { block }
             };
@@ -1559,6 +1626,8 @@ impl AcpThread {
                     raw_output: None,
                     tool_name: None,
                     subagent_session_info: None,
+                    started_at: None,
+                    completed_at: None,
                 };
                 self.push_entry(AgentThreadEntry::ToolCall(failed_tool_call), cx);
                 return Ok(());
@@ -1873,11 +1942,26 @@ impl AcpThread {
                 content,
                 priority,
                 status,
+                started_at,
+                completed_at,
             } = old;
             content.update(cx, |old, cx| {
                 old.replace(new.content, cx);
             });
             *priority = new.priority;
+
+            // Track timing when status changes
+            if status != &new.status {
+                match &new.status {
+                    acp::PlanEntryStatus::InProgress if started_at.is_none() => {
+                        *started_at = Some(Instant::now());
+                    }
+                    acp::PlanEntryStatus::Completed if completed_at.is_none() => {
+                        *completed_at = Some(Instant::now());
+                    }
+                    _ => {}
+                }
+            }
             *status = new.status;
         }
         for new in new_entries {

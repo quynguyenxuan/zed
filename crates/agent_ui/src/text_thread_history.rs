@@ -14,6 +14,7 @@ use ui::{
     HighlightedLabel, IconButtonShape, ListItem, ListItemSpacing, Tab, Tooltip, WithScrollbar,
     prelude::*,
 };
+use workspace::item::{self, Item};
 
 const DEFAULT_TITLE: &SharedString = &SharedString::new_static("New Thread");
 
@@ -614,6 +615,24 @@ impl Render for TextThreadHistory {
 impl Focusable for TextThreadHistory {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.search_editor.focus_handle(cx)
+    }
+}
+
+impl Item for TextThreadHistory {
+    type Event = TextThreadHistoryEvent;
+
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        "Text Thread History".into()
+    }
+
+    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(item::ItemEvent)) {
+        match event {
+            TextThreadHistoryEvent::Open(_) => {}
+        }
+    }
+
+    fn include_in_nav_history() -> bool {
+        false
     }
 }
 

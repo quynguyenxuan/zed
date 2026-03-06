@@ -1,6 +1,6 @@
 use crate::ConnectionView;
 use crate::{AgentPanel, RemoveHistory, RemoveSelectedThread};
-use acp_thread::{AgentSessionInfo, AgentSessionList, AgentSessionListRequest, SessionListUpdate};
+use acp_thread::{tool_name_from_meta, AgentSessionInfo, AgentSessionList, AgentSessionListRequest, SessionListUpdate};
 use agent_client_protocol as acp;
 use chrono::{Datelike as _, Local, NaiveDate, TimeDelta, Utc};
 use editor::{Editor, EditorEvent};
@@ -16,6 +16,7 @@ use ui::{
     ElementId, HighlightedLabel, IconButtonShape, ListItem, ListItemSpacing, Tab, Tooltip,
     WithScrollbar, prelude::*,
 };
+use workspace::item::{self, Item};
 
 const DEFAULT_TITLE: &SharedString = &SharedString::new_static("New Thread");
 
@@ -42,6 +43,7 @@ pub struct ThreadHistory {
     _refresh_task: Task<()>,
     _watch_task: Option<Task<()>>,
     _subscriptions: Vec<gpui::Subscription>,
+    connection_view: Option<WeakEntity<ConnectionView>>,
 }
 
 enum ListItemType {
@@ -71,6 +73,24 @@ pub enum ThreadHistoryEvent {
 }
 
 impl EventEmitter<ThreadHistoryEvent> for ThreadHistory {}
+
+impl Item for ThreadHistory {
+    type Event = ThreadHistoryEvent;
+
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        "Thread History".into()
+    }
+
+    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(item::ItemEvent)) {
+        match event {
+            ThreadHistoryEvent::Open(_) => {}
+        }
+    }
+
+    fn include_in_nav_history() -> bool {
+        false
+    }
+}
 
 impl ThreadHistory {
     pub fn new(
@@ -115,6 +135,7 @@ impl ThreadHistory {
             _visible_items_task: Task::ready(()),
             _refresh_task: Task::ready(()),
             _watch_task: None,
+            connection_view: None,
         };
         this.set_session_list(session_list, cx);
         this
@@ -341,6 +362,30 @@ impl ThreadHistory {
     pub fn refresh(&mut self, _cx: &mut Context<Self>) {
         if let Some(session_list) = &self.session_list {
             session_list.notify_refresh();
+        }
+    }
+
+    pub fn set_connection_view(&mut self, connection_view: WeakEntity<ConnectionView>) {
+        self.connection_view = Some(connection_view);
+    }
+
+    fn is_thread_running(&self, session_id: &acp::SessionId, cx: &App) -> bool {
+        self.connection_view
+            .as_ref()
+            .and_then(|view| view.upgrade())
+            .and_then(|view| {
+                view.read(cx)
+                    .as_connected()
+                    .map(|connected| connected.is_thread_generating(session_id, cx))
+            })
+            .unwrap_or(false)
+    }
+
+    fn cancel_thread_by_id(&self, _session_id: &acp::SessionId, cx: &mut App) {
+        if let Some(view) = self.connection_view.as_ref().and_then(|v| v.upgrade()) {
+            view.update(cx, |view, cx| {
+                view.cancel_generation(cx);
+            });
         }
     }
 
@@ -661,6 +706,13 @@ impl ThreadHistory {
             })
             .unwrap_or_else(|| "Unknown".to_string());
 
+        let agent_name = tool_name_from_meta(&entry.meta);
+        let display_title = if let Some(name) = agent_name {
+            SharedString::from(format!("{}: {}", name, title))
+        } else {
+            title.clone()
+        };
+
         h_flex()
             .w_full()
             .pb_1()
@@ -675,7 +727,7 @@ impl ThreadHistory {
                             .gap_2()
                             .justify_between()
                             .child(
-                                HighlightedLabel::new(thread_title(entry), highlight_positions)
+                                HighlightedLabel::new(display_title, highlight_positions)
                                     .size(LabelSize::Small)
                                     .truncate(),
                             )
@@ -697,20 +749,39 @@ impl ThreadHistory {
 
                         cx.notify();
                     }))
-                    .end_slot::<IconButton>(if hovered && self.supports_delete() {
-                        Some(
-                            IconButton::new("delete", IconName::Trash)
-                                .shape(IconButtonShape::Square)
-                                .icon_size(IconSize::XSmall)
-                                .icon_color(Color::Muted)
-                                .tooltip(move |_window, cx| {
-                                    Tooltip::for_action("Delete", &RemoveSelectedThread, cx)
-                                })
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.remove_thread(ix, cx);
-                                    cx.stop_propagation()
-                                })),
-                        )
+                    .end_slot::<IconButton>(if hovered {
+                        let session_id = entry.session_id.clone();
+                        let is_running = self.is_thread_running(&session_id, cx);
+
+                        if is_running {
+                            Some(
+                                IconButton::new("stop", IconName::Stop)
+                                    .shape(IconButtonShape::Square)
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Error)
+                                    .tooltip(Tooltip::text("Stop"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.cancel_thread_by_id(&session_id, cx);
+                                        cx.stop_propagation()
+                                    })),
+                            )
+                        } else if self.supports_delete() {
+                            Some(
+                                IconButton::new("delete", IconName::Trash)
+                                    .shape(IconButtonShape::Square)
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(move |_window, cx| {
+                                        Tooltip::for_action("Delete", &RemoveSelectedThread, cx)
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.remove_thread(ix, cx);
+                                        cx.stop_propagation()
+                                    })),
+                            )
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     })

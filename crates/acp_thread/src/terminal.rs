@@ -2,7 +2,7 @@ use agent_client_protocol as acp;
 use anyhow::Result;
 use futures::{FutureExt as _, future::Shared};
 use gpui::{App, AppContext, AsyncApp, Context, Entity, Task};
-use language::LanguageRegistry;
+use language::{LanguageName, LanguageRegistry};
 use markdown::Markdown;
 use project::Project;
 use std::{
@@ -55,9 +55,9 @@ impl Terminal {
             id,
             command: cx.new(|cx| {
                 Markdown::new(
-                    format!("```\n{}\n```", command_label).into(),
+                    format!("```bash\n{}\n```", command_label).into(),
                     Some(language_registry.clone()),
-                    None,
+                    Some(LanguageName::new_static("Shell Script")),
                     cx,
                 )
             }),
@@ -169,7 +169,7 @@ impl Terminal {
 
     pub fn update_command_label(&self, label: &str, cx: &mut App) {
         self.command.update(cx, |command, cx| {
-            command.replace(format!("```\n{}\n```", label), cx);
+            command.replace(format!("```bash\n{}\n```", label), cx);
         });
     }
 
@@ -222,6 +222,7 @@ pub async fn create_terminal_entity(
     env.insert("PAGER".into(), "".into());
     // Override user core.pager (e.g. delta) which Git prefers over PAGER
     env.insert("GIT_PAGER".into(), "cat".into());
+
     env.extend(env_vars);
 
     // Use remote shell or default system shell, as appropriate

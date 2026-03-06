@@ -281,9 +281,11 @@ pub struct TurnFields {
     pub _turn_timer_task: Option<Task<()>>,
     pub last_turn_duration: Option<Duration>,
     pub last_turn_tokens: Option<u64>,
+    pub last_turn_tool_call_count: u32,
     pub turn_generation: usize,
     pub turn_started_at: Option<Instant>,
     pub turn_tokens: Option<u64>,
+    pub tool_call_count: u32,
 }
 
 impl ThreadView {
@@ -747,6 +749,7 @@ impl ThreadView {
         self.turn_fields.last_turn_duration = None;
         self.turn_fields.last_turn_tokens = None;
         self.turn_fields.turn_tokens = Some(0);
+        self.turn_fields.tool_call_count = 0;
         self.turn_fields._turn_timer_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -768,6 +771,7 @@ impl ThreadView {
             .take()
             .map(|started| started.elapsed());
         self.turn_fields.last_turn_tokens = self.turn_fields.turn_tokens.take();
+        self.turn_fields.last_turn_tool_call_count = self.turn_fields.tool_call_count;
         self.turn_fields._turn_timer_task = None;
     }
 
@@ -2366,6 +2370,8 @@ impl ThreadView {
         window: &mut Window,
         cx: &Context<Self>,
     ) -> impl IntoElement {
+        let show_stats = AgentSettings::get_global(cx).show_turn_stats;
+
         v_flex()
             .id("plan_items_list")
             .max_h_40()
@@ -2412,7 +2418,18 @@ impl ThreadView {
                             .child(MarkdownElement::new(
                                 entry.content.clone(),
                                 plan_label_markdown_style(&entry.status, window, cx),
-                            )),
+                            ))
+                            .when_some(
+                                show_stats.then(|| {
+                                    entry.started_at.zip(entry.completed_at).map(|(started, completed)| {
+                                        let duration = completed.duration_since(started);
+                                        Label::new(format!("({})", duration_alt_display(duration)))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted)
+                                    })
+                                }).flatten(),
+                                |this, label| this.child(label)
+                            ),
                     );
 
                 Some(element)
@@ -3927,7 +3944,7 @@ impl ThreadView {
                                     )
                                 })
                             }
-                            AssistantMessageChunk::Thought { block } => {
+                            AssistantMessageChunk::Thought { block, started_at, completed_at } => {
                                 block.markdown().and_then(|md| {
                                     let this_is_blank = md.read(cx).source().trim().is_empty();
                                     is_blank = is_blank && this_is_blank;
@@ -3939,6 +3956,8 @@ impl ThreadView {
                                             entry_ix,
                                             chunk_ix,
                                             md.clone(),
+                                            *started_at,
+                                            *completed_at,
                                             window,
                                             cx,
                                         )
@@ -4209,6 +4228,20 @@ impl ThreadView {
             })
             .flatten();
 
+        let show_tool_stats = AgentSettings::get_global(cx).show_turn_stats;
+        let last_turn_tool_count_label = show_tool_stats.then(|| {
+            let count = self.turn_fields.last_turn_tool_call_count;
+            (count > 0).then(|| {
+                Label::new(format!(
+                    "{} tool{}",
+                    count,
+                    if count == 1 { "" } else { "s" }
+                ))
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+            })
+        }).flatten();
+
         let mut container = h_flex()
             .w_full()
             .py_2()
@@ -4218,12 +4251,13 @@ impl ThreadView {
             .hover(|s| s.opacity(1.))
             .justify_end()
             .when(
-                last_turn_tokens_label.is_some() || last_turn_clock.is_some(),
+                last_turn_tokens_label.is_some() || last_turn_clock.is_some() || last_turn_tool_count_label.is_some(),
                 |this| {
                     this.child(
                         h_flex()
                             .gap_1()
                             .px_1()
+                            .when_some(last_turn_tool_count_label, |this, label| this.child(label))
                             .when_some(last_turn_tokens_label, |this, label| this.child(label))
                             .when_some(last_turn_clock, |this, label| this.child(label)),
                     )
@@ -4453,6 +4487,20 @@ impl ThreadView {
             })
             .flatten();
 
+        let show_tool_stats = AgentSettings::get_global(cx).show_turn_stats;
+        let live_tool_count_label = show_tool_stats.then(|| {
+            let count = self.turn_fields.tool_call_count;
+            (count > 0).then(|| {
+                Label::new(format!(
+                    "{} tool{}",
+                    count,
+                    if count == 1 { "" } else { "s" }
+                ))
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+            })
+        }).flatten();
+
         let arrow_icon = if is_waiting {
             IconName::ArrowUp
         } else {
@@ -4507,7 +4555,44 @@ impl ThreadView {
                         ),
                 )
             })
+            .when_some(live_tool_count_label, |this, label| this.child(label))
             .into_any_element()
+    }
+
+    fn render_block_duration_inline(
+        &self,
+        started_at: Option<std::time::Instant>,
+        completed_at: Option<std::time::Instant>,
+        cx: &Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let show_stats = AgentSettings::get_global(cx).show_turn_stats;
+        show_stats.then(|| {
+            started_at.zip(completed_at).map(|(started, completed)| {
+                let duration = completed.duration_since(started);
+                let duration_text = Self::format_duration_compact(duration);
+
+                Label::new(duration_text)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+            })
+        }).flatten()
+    }
+
+    fn format_duration_compact(duration: std::time::Duration) -> String {
+        let total_secs = duration.as_secs_f64();
+
+        if total_secs >= 3600.0 {
+            let hours = (total_secs / 3600.0).floor();
+            let minutes = ((total_secs % 3600.0) / 60.0).floor();
+            let seconds = (total_secs % 60.0).floor();
+            format!("{}h{}m{}s", hours, minutes, seconds)
+        } else if total_secs >= 60.0 {
+            let minutes = (total_secs / 60.0).floor();
+            let seconds = total_secs % 60.0;
+            format!("{}m{:.1}s", minutes, seconds)
+        } else {
+            format!("{:.1}s", total_secs)
+        }
     }
 
     fn render_thinking_block(
@@ -4515,6 +4600,8 @@ impl ThreadView {
         entry_ix: usize,
         chunk_ix: usize,
         chunk: Entity<Markdown>,
+        started_at: Option<std::time::Instant>,
+        completed_at: Option<std::time::Instant>,
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -4573,20 +4660,29 @@ impl ThreadView {
                             ),
                     )
                     .child(
-                        Disclosure::new(("expand", entry_ix), is_open)
-                            .opened_icon(IconName::ChevronUp)
-                            .closed_icon(IconName::ChevronDown)
-                            .visible_on_hover(&card_header_id)
-                            .on_click(cx.listener({
-                                move |this, _event, _window, cx| {
-                                    if is_open {
-                                        this.expanded_thinking_blocks.remove(&key);
-                                    } else {
-                                        this.expanded_thinking_blocks.insert(key);
-                                    }
-                                    cx.notify();
-                                }
-                            })),
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .when_some(
+                                self.render_block_duration_inline(started_at, completed_at, cx),
+                                |this, duration| this.child(duration)
+                            )
+                            .child(
+                                Disclosure::new(("expand", entry_ix), is_open)
+                                    .opened_icon(IconName::ChevronUp)
+                                    .closed_icon(IconName::ChevronDown)
+                                    .visible_on_hover(&card_header_id)
+                                    .on_click(cx.listener({
+                                        move |this, _event, _window, cx| {
+                                            if is_open {
+                                                this.expanded_thinking_blocks.remove(&key);
+                                            } else {
+                                                this.expanded_thinking_blocks.insert(key);
+                                            }
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
                     )
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         if is_open {
@@ -4643,7 +4739,7 @@ impl ThreadView {
                             chunks.iter().any(|chunk| {
                                 let md = match chunk {
                                     AssistantMessageChunk::Message { block } => block.markdown(),
-                                    AssistantMessageChunk::Thought { block } => block.markdown(),
+                                    AssistantMessageChunk::Thought { block, .. } => block.markdown(),
                                 };
                                 md.map_or(false, |m| m.read(cx).selected_text().is_some())
                             })
@@ -4802,7 +4898,9 @@ impl ThreadView {
         &self,
         group: SharedString,
         is_preview: bool,
+        command: &Entity<Markdown>,
         command_source: &str,
+        window: &Window,
         cx: &Context<Self>,
     ) -> Div {
         v_flex()
@@ -4821,15 +4919,12 @@ impl ThreadView {
                     ),
                 )
             })
-            .children(command_source.lines().map(|line| {
-                let text: SharedString = if line.is_empty() {
-                    " ".into()
-                } else {
-                    line.to_string().into()
-                };
-
-                Label::new(text).buffer_font(cx).size(LabelSize::Small)
-            }))
+            .child(
+                self.render_markdown(
+                    command.clone(),
+                    MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                )
+            )
             .child(
                 div().absolute().top_1().right_1().child(
                     CopyButton::new("copy-command", command_source.to_string())
@@ -4904,16 +4999,16 @@ impl ThreadView {
             .unwrap_or_else(|| "current directory".to_string());
 
         // Since the command's source is wrapped in a markdown code block
-        // (```\n...\n```), we need to strip that so we're left with only the
+        // (```bash\n...\n```), we need to strip that so we're left with only the
         // command's content.
         let command_source = command.read(cx).source();
         let command_content = command_source
-            .strip_prefix("```\n")
+            .strip_prefix("```bash\n")
             .and_then(|s| s.strip_suffix("\n```"))
             .unwrap_or(&command_source);
 
         let command_element =
-            self.render_collapsible_command(header_group.clone(), false, command_content, cx);
+            self.render_collapsible_command(header_group.clone(), false, command, command_content, window, cx);
 
         let is_expanded = self.expanded_tool_calls.contains(&tool_call.id);
 
@@ -4962,14 +5057,12 @@ impl ThreadView {
                     }
                 })),
             )
-            .when(time_elapsed > Duration::from_secs(10), |header| {
-                header.child(
-                    Label::new(format!("({})", duration_alt_display(time_elapsed)))
-                        .buffer_font(cx)
-                        .color(Color::Muted)
-                        .size(LabelSize::XSmall),
-                )
-            })
+            .child(
+                Label::new(format!("({})", duration_alt_display(time_elapsed)))
+                    .buffer_font(cx)
+                    .color(Color::Muted)
+                    .size(LabelSize::XSmall),
+            )
             .when(!command_finished && !needs_confirmation, |header| {
                 header
                     .gap_1p5()
@@ -5455,10 +5548,19 @@ impl ThreadView {
             .map(|this| {
                 if is_terminal_tool {
                     let label_source = tool_call.label.read(cx).source();
+                    // Strip markdown fence to get raw command text
+                    let command_text = label_source
+                        .strip_prefix("```bash\n")
+                        .and_then(|s| s.strip_suffix("\n```"))
+                        .or_else(|| label_source.strip_prefix("```\n").and_then(|s| s.strip_suffix("\n```")))
+                        .unwrap_or(label_source);
+
                     this.child(self.render_collapsible_command(
                         card_header_id.clone(),
                         true,
-                        label_source,
+                        &tool_call.label,
+                        command_text,
+                        window,
                         cx,
                     ))
                 } else {
@@ -5487,6 +5589,11 @@ impl ThreadView {
                             .child(
                                 h_flex()
                                     .gap_0p5()
+                                    .items_center()
+                                    .when_some(
+                                        self.render_block_duration_inline(tool_call.started_at, tool_call.completed_at, cx),
+                                        |this, duration| this.child(duration)
+                                    )
                                     .when(is_collapsible || failed_or_canceled, |this| {
                                         let diff_for_discard = if has_revealed_diff
                                             && is_cancelled_edit
@@ -6135,6 +6242,14 @@ impl ThreadView {
                     ))
                     .into_any()
             })
+            .when_some(
+                self.render_block_duration_inline(
+                    tool_call.started_at,
+                    tool_call.completed_at,
+                    cx,
+                ),
+                |this, duration| this.child(duration),
+            )
             .when(!is_edit, |this| this.child(gradient_overlay))
     }
 
@@ -6710,6 +6825,10 @@ impl ThreadView {
                                     )
                                 })
                             })
+                            .when_some(
+                                self.render_block_duration_inline(tool_call.started_at, tool_call.completed_at, cx),
+                                |this, duration| this.child(duration)
+                            )
                             .when(has_expandable_content && !is_pending_tool_call, |this| {
                                 this.cursor_pointer()
                                     .hover(|s| s.bg(cx.theme().colors().element_hover))

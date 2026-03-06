@@ -14,7 +14,6 @@ use acp_thread::{AgentSessionInfo, MentionUri};
 use agent::ThreadStore;
 use agent_client_protocol as acp;
 use anyhow::{Result, anyhow};
-use collections::HashSet;
 use editor::{
     Addon, AnchorRangeExt, ContextMenuOptions, ContextMenuPlacement, Editor, EditorElement,
     EditorEvent, EditorMode, EditorStyle, Inlay, MultiBuffer, MultiBufferOffset,
@@ -26,7 +25,7 @@ use gpui::{
     AppContext, ClipboardEntry, Context, Entity, EventEmitter, FocusHandle, Focusable, ImageFormat,
     KeyContext, SharedString, Subscription, Task, TextStyle, WeakEntity,
 };
-use language::{Buffer, Language, language_settings::InlayHintKind};
+use language::{Buffer, language_settings::InlayHintKind};
 use project::{CompletionIntent, InlayHint, InlayHintLabel, InlayId, Project, Worktree};
 use prompt_store::PromptStore;
 use rope::Point;
@@ -118,16 +117,16 @@ impl MessageEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let language = Language::new(
-            language::LanguageConfig {
-                completion_query_characters: HashSet::from_iter(['.', '-', '_', '@']),
-                ..Default::default()
-            },
-            None,
-        );
+        let language_registry = project
+            .upgrade()
+            .map(|project| project.read(cx).languages().clone());
+
+        let markdown_language = language_registry
+            .as_ref()
+            .map(|registry| registry.language_for_name("Markdown"));
 
         let editor = cx.new(|cx| {
-            let buffer = cx.new(|cx| Buffer::local("", cx).with_language(Arc::new(language), cx));
+            let buffer = cx.new(|cx| Buffer::local("", cx));
             let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
 
             let mut editor = Editor::new(mode, buffer, None, window, cx);
@@ -181,6 +180,24 @@ impl MessageEditor {
             cx.emit(MessageEditorEvent::LostFocus)
         })
         .detach();
+
+        // Set markdown language asynchronously
+        if let Some(markdown_language) = markdown_language {
+            let buffer = editor.read(cx).buffer().clone();
+            cx.spawn_in(window, async move |_, cx| {
+                if let Ok(markdown) = markdown_language.await {
+                    buffer.update(cx, |buffer, cx| {
+                        if let Some(singleton) = buffer.as_singleton() {
+                            singleton.update(cx, |buffer, cx| {
+                                buffer.set_language(Some(markdown), cx);
+                            });
+                        }
+                    });
+                }
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+        }
 
         let mut has_hint = false;
         let mut subscriptions = Vec::new();

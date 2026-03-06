@@ -55,7 +55,9 @@ use ui::{
 use util::{ResultExt, size::format_file_size, time::duration_alt_display};
 use util::{debug_panic, defer};
 use workspace::{
-    CollaboratorId, MultiWorkspace, NewTerminal, Toast, Workspace, notifications::NotificationId,
+    CollaboratorId, MultiWorkspace, NewTerminal, Toast, Workspace, WorkspaceId,
+    item::{Item, ItemEvent, TabContentParams},
+    notifications::NotificationId,
 };
 use zed_actions::agent::{Chat, ToggleModelSelector};
 use zed_actions::assistant::OpenRulesLibrary;
@@ -79,8 +81,8 @@ use crate::{
     ToggleThinkingMode, UndoLastReject,
 };
 
-const STOPWATCH_THRESHOLD: Duration = Duration::from_secs(30);
-const TOKEN_THRESHOLD: u64 = 250;
+const STOPWATCH_THRESHOLD: Duration = Duration::from_secs(2);
+const TOKEN_THRESHOLD: u64 = 50;
 
 mod thread_view;
 pub use thread_view::*;
@@ -154,7 +156,7 @@ impl ProfileProvider for Entity<agent::Thread> {
 pub(crate) struct Conversation {
     threads: HashMap<acp::SessionId, Entity<AcpThread>>,
     permission_requests: IndexMap<acp::SessionId, Vec<acp::ToolCallId>>,
-    subscriptions: Vec<Subscription>,
+    subscriptions: HashMap<acp::SessionId, Subscription>,
     /// Tracks the selected granularity index for each tool call's permission dropdown.
     /// The index corresponds to the position in the allow_options list.
     selected_permission_granularity: HashMap<acp::SessionId, HashMap<acp::ToolCallId, usize>>,
@@ -163,40 +165,49 @@ pub(crate) struct Conversation {
 impl Conversation {
     pub fn register_thread(&mut self, thread: Entity<AcpThread>, cx: &mut Context<Self>) {
         let session_id = thread.read(cx).session_id().clone();
-        let subscription = cx.subscribe(&thread, move |this, _thread, event, _cx| match event {
-            AcpThreadEvent::ToolAuthorizationRequested(id) => {
-                this.permission_requests
-                    .entry(session_id.clone())
-                    .or_default()
-                    .push(id.clone());
-            }
-            AcpThreadEvent::ToolAuthorizationReceived(id) => {
-                if let Some(tool_calls) = this.permission_requests.get_mut(&session_id) {
-                    tool_calls.retain(|tool_call_id| tool_call_id != id);
-                    if tool_calls.is_empty() {
-                        this.permission_requests.shift_remove(&session_id);
+        let subscription = {
+            let session_id = session_id.clone();
+            cx.subscribe(&thread, move |this, _thread, event, _cx| match event {
+                AcpThreadEvent::ToolAuthorizationRequested(id) => {
+                    this.permission_requests
+                        .entry(session_id.clone())
+                        .or_default()
+                        .push(id.clone());
+                }
+                AcpThreadEvent::ToolAuthorizationReceived(id) => {
+                    if let Some(tool_calls) = this.permission_requests.get_mut(&session_id) {
+                        tool_calls.retain(|tool_call_id| tool_call_id != id);
+                        if tool_calls.is_empty() {
+                            this.permission_requests.shift_remove(&session_id);
+                        }
                     }
                 }
-            }
-            AcpThreadEvent::NewEntry
-            | AcpThreadEvent::TitleUpdated
-            | AcpThreadEvent::TokenUsageUpdated
-            | AcpThreadEvent::EntryUpdated(_)
-            | AcpThreadEvent::EntriesRemoved(_)
-            | AcpThreadEvent::Retry(_)
-            | AcpThreadEvent::SubagentSpawned(_)
-            | AcpThreadEvent::Stopped(_)
-            | AcpThreadEvent::Error
-            | AcpThreadEvent::LoadError(_)
-            | AcpThreadEvent::PromptCapabilitiesUpdated
-            | AcpThreadEvent::Refusal
-            | AcpThreadEvent::AvailableCommandsUpdated(_)
-            | AcpThreadEvent::ModeUpdated(_)
-            | AcpThreadEvent::ConfigOptionsUpdated(_) => {}
-        });
-        self.subscriptions.push(subscription);
-        self.threads
-            .insert(thread.read(cx).session_id().clone(), thread);
+                AcpThreadEvent::NewEntry
+                | AcpThreadEvent::TitleUpdated
+                | AcpThreadEvent::TokenUsageUpdated
+                | AcpThreadEvent::EntryUpdated(_)
+                | AcpThreadEvent::EntriesRemoved(_)
+                | AcpThreadEvent::Retry(_)
+                | AcpThreadEvent::SubagentSpawned(_)
+                | AcpThreadEvent::Stopped(_)
+                | AcpThreadEvent::Error
+                | AcpThreadEvent::LoadError(_)
+                | AcpThreadEvent::PromptCapabilitiesUpdated
+                | AcpThreadEvent::Refusal
+                | AcpThreadEvent::AvailableCommandsUpdated(_)
+                | AcpThreadEvent::ModeUpdated(_)
+                | AcpThreadEvent::ConfigOptionsUpdated(_) => {}
+            })
+        };
+        self.subscriptions.insert(session_id.clone(), subscription);
+        self.threads.insert(session_id, thread);
+    }
+
+    pub fn unregister_thread(&mut self, session_id: &acp::SessionId) {
+        self.threads.remove(session_id);
+        self.subscriptions.remove(session_id);
+        self.permission_requests.shift_remove(session_id);
+        self.selected_permission_granularity.remove(session_id);
     }
 
     pub fn selected_permission_granularity(
@@ -300,6 +311,7 @@ pub enum AcpServerViewEvent {
 }
 
 impl EventEmitter<AcpServerViewEvent> for ConnectionView {}
+impl EventEmitter<ItemEvent> for ConnectionView {}
 
 pub struct ConnectionView {
     agent: Rc<dyn AgentServer>,
@@ -395,6 +407,130 @@ impl ConnectionView {
         cx.emit(AcpServerViewEvent::ActiveThreadChanged);
         cx.notify();
     }
+
+    pub fn close_thread(
+        &mut self,
+        session_id: acp::SessionId,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(connected) = self.as_connected_mut() {
+            connected.close_thread(&session_id, cx).detach();
+        }
+        cx.emit(AcpServerViewEvent::ActiveThreadChanged);
+        cx.notify();
+    }
+
+    pub fn agent_name(&self) -> SharedString {
+        self.agent.name()
+    }
+
+    pub fn is_native_agent(&self) -> bool {
+        self.agent.clone().downcast::<NativeAgentServer>().is_some()
+    }
+
+    pub fn root_thread_tabs(&self, cx: &App) -> Vec<(acp::SessionId, SharedString, bool)> {
+        let Some(connected) = self.as_connected() else {
+            return vec![];
+        };
+        connected
+            .threads
+            .iter()
+            .filter_map(|(id, v)| {
+                let view = v.read(cx);
+                if view.parent_id.is_none() {
+                    let is_active = connected.active_id.as_ref() == Some(id);
+                    Some((id.clone(), view.thread.read(cx).title(), is_active))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn add_new_thread(
+        &mut self,
+        initial_content: Option<AgentInitialContent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(connected) = self.as_connected() else {
+            return;
+        };
+        let connection = connected.connection.clone();
+        let conversation = connected.conversation.clone();
+        let project = self.project.clone();
+
+        let mut worktrees = project.read(cx).visible_worktrees(cx).collect::<Vec<_>>();
+        worktrees.sort_by(|l, r| {
+            l.read(cx)
+                .is_single_file()
+                .cmp(&r.read(cx).is_single_file())
+        });
+        let session_cwd: Arc<Path> = worktrees
+            .iter()
+            .find_map(|worktree| {
+                let worktree = worktree.read(cx);
+                if worktree.is_single_file() {
+                    Some(worktree.abs_path().parent()?.into())
+                } else {
+                    Some(worktree.abs_path())
+                }
+            })
+            .unwrap_or_else(|| paths::home_dir().as_path().into());
+
+        cx.spawn_in(window, async move |this, cx| {
+            let task = cx
+                .update(|_, cx| {
+                    connection
+                        .clone()
+                        .new_session(project.clone(), session_cwd.as_ref(), cx)
+                })
+                .log_err();
+            let Some(task) = task else { return };
+
+            match task.await {
+                Ok(thread) => {
+                    this.update_in(cx, |this, window, cx| {
+                        conversation.update(cx, |conv, cx| {
+                            conv.register_thread(thread.clone(), cx);
+                        });
+                        let view = this.new_thread_view(
+                            None,
+                            thread,
+                            conversation,
+                            false,
+                            None,
+                            initial_content,
+                            window,
+                            cx,
+                        );
+                        if this.focus_handle.contains_focused(window, cx) {
+                            view.read(cx)
+                                .message_editor
+                                .focus_handle(cx)
+                                .focus(window, cx);
+                        }
+                        let id = view.read(cx).thread.read(cx).session_id().clone();
+                        if let Some(connected) = this.as_connected_mut() {
+                            connected.threads.insert(id.clone(), view);
+                            connected.active_id = Some(id);
+                        }
+                        cx.emit(AcpServerViewEvent::ActiveThreadChanged);
+                        cx.notify();
+                    })
+                    .log_err();
+                }
+                Err(err) => {
+                    this.update_in(cx, |this, window, cx| {
+                        this.handle_load_error(err, window, cx);
+                    })
+                    .log_err();
+                }
+            }
+        })
+        .detach();
+    }
 }
 
 enum ServerState {
@@ -436,6 +572,15 @@ struct LoadingView {
 }
 
 impl ConnectedServerState {
+    pub fn is_thread_generating(&self, session_id: &acp::SessionId, cx: &App) -> bool {
+        self.threads
+            .get(session_id)
+            .map(|thread| {
+                thread.read(cx).thread.read(cx).status() == acp_thread::ThreadStatus::Generating
+            })
+            .unwrap_or(false)
+    }
+
     pub fn active_view(&self) -> Option<&Entity<ThreadView>> {
         self.active_id.as_ref().and_then(|id| self.threads.get(id))
     }
@@ -459,6 +604,25 @@ impl ConnectedServerState {
         let task = futures::future::join_all(tasks);
         cx.background_spawn(async move {
             task.await;
+        })
+    }
+
+    pub fn close_thread(&mut self, session_id: &acp::SessionId, cx: &mut App) -> Task<()> {
+        self.threads.remove(session_id);
+        self.conversation.update(cx, |conv, _cx| {
+            conv.unregister_thread(session_id);
+        });
+        if self.active_id.as_ref() == Some(session_id) {
+            self.active_id = self
+                .threads
+                .iter()
+                .find(|(_, v)| v.read(cx).parent_id.is_none())
+                .map(|(id, _)| id.clone())
+                .or_else(|| self.threads.keys().next().cloned());
+        }
+        let task = self.connection.close_session(session_id, cx);
+        cx.background_spawn(async move {
+            task.await.log_err();
         })
     }
 }
@@ -501,7 +665,7 @@ impl ConnectionView {
         })
         .detach();
 
-        Self {
+        let view = Self {
             agent: agent.clone(),
             agent_server_store,
             workspace,
@@ -522,7 +686,15 @@ impl ConnectionView {
             history,
             _subscriptions: subscriptions,
             focus_handle: cx.focus_handle(),
-        }
+        };
+
+        // Set connection view reference in history
+        let weak_view = cx.entity().downgrade();
+        view.history.update(cx, |history, _| {
+            history.set_connection_view(weak_view);
+        });
+
+        view
     }
 
     fn set_server_state(&mut self, state: ServerState, cx: &mut Context<Self>) {
@@ -710,50 +882,78 @@ impl ConnectionView {
             this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(thread) => {
-                        let conversation = cx.new(|cx| {
-                            let mut conversation = Conversation::default();
-                            conversation.register_thread(thread.clone(), cx);
-                            conversation
-                        });
-
-                        let current = this.new_thread_view(
-                            None,
-                            thread,
-                            conversation.clone(),
-                            resumed_without_history,
-                            resume_thread,
-                            initial_content,
-                            window,
-                            cx,
-                        );
-
-                        if this.focus_handle.contains_focused(window, cx) {
-                            current
-                                .read(cx)
-                                .message_editor
-                                .focus_handle(cx)
-                                .focus(window, cx);
-                        }
-
-                        let id = current.read(cx).thread.read(cx).session_id().clone();
-                        let session_list = if connection.supports_session_history() {
-                            connection.session_list(cx)
-                        } else {
-                            None
-                        };
-                        this.history.update(cx, |history, cx| {
-                            history.set_session_list(session_list, cx);
-                        });
-                        this.set_server_state(
-                            ServerState::Connected(ConnectedServerState {
-                                connection,
-                                auth_state: AuthState::Ok,
-                                active_id: Some(id.clone()),
-                                threads: HashMap::from_iter([(id, current)]),
+                        if let Some(conversation) = this.as_connected().map(|c| c.conversation.clone()) {
+                            // Already connected: add as a new tab without closing existing threads.
+                            conversation.update(cx, |conv, cx| {
+                                conv.register_thread(thread.clone(), cx);
+                            });
+                            let view = this.new_thread_view(
+                                None,
+                                thread,
                                 conversation,
-                            }),
-                            cx,
-                        );
+                                resumed_without_history,
+                                resume_thread,
+                                initial_content,
+                                window,
+                                cx,
+                            );
+                            if this.focus_handle.contains_focused(window, cx) {
+                                view.read(cx)
+                                    .message_editor
+                                    .focus_handle(cx)
+                                    .focus(window, cx);
+                            }
+                            let id = view.read(cx).thread.read(cx).session_id().clone();
+                            if let Some(connected) = this.as_connected_mut() {
+                                connected.threads.insert(id.clone(), view);
+                                connected.active_id = Some(id);
+                            }
+                            cx.emit(AcpServerViewEvent::ActiveThreadChanged);
+                            cx.notify();
+                        } else {
+                            // First connection: create a fresh connected state.
+                            let conversation = cx.new(|cx| {
+                                let mut conversation = Conversation::default();
+                                conversation.register_thread(thread.clone(), cx);
+                                conversation
+                            });
+                            let current = this.new_thread_view(
+                                None,
+                                thread,
+                                conversation.clone(),
+                                resumed_without_history,
+                                resume_thread,
+                                initial_content,
+                                window,
+                                cx,
+                            );
+                            if this.focus_handle.contains_focused(window, cx) {
+                                current
+                                    .read(cx)
+                                    .message_editor
+                                    .focus_handle(cx)
+                                    .focus(window, cx);
+                            }
+                            let id = current.read(cx).thread.read(cx).session_id().clone();
+                            let session_list = if connection.supports_session_history() {
+                                connection.session_list(cx)
+                            } else {
+                                None
+                            };
+                            this.history.update(cx, |history, cx| {
+                                history.set_session_list(session_list, cx);
+                            });
+                            this.set_server_state(
+                                ServerState::Connected(ConnectedServerState {
+                                    connection,
+                                    auth_state: AuthState::Ok,
+                                    active_id: Some(id.clone()),
+                                    threads: HashMap::from_iter([(id, current)]),
+                                    conversation,
+                                }),
+                                cx,
+                            );
+                        }
                     }
                     Err(err) => {
                         this.handle_load_error(err, window, cx);
@@ -1204,7 +1404,17 @@ impl ConnectionView {
             AcpThreadEvent::NewEntry => {
                 let len = thread.read(cx).entries().len();
                 let index = len - 1;
+                let new_entry_is_tool_call = matches!(
+                    thread.read(cx).entries().get(index),
+                    Some(AgentThreadEntry::ToolCall(_))
+                );
                 if let Some(active) = self.thread_view(&thread_id) {
+                    if new_entry_is_tool_call {
+                        active.update(cx, |active, _cx| {
+                            active.turn_fields.tool_call_count =
+                                active.turn_fields.tool_call_count.saturating_add(1);
+                        });
+                    }
                     let entry_view_state = active.read(cx).entry_view_state.clone();
                     let list_state = active.read(cx).list_state.clone();
                     entry_view_state.update(cx, |view_state, cx| {
@@ -2652,14 +2862,63 @@ impl Render for ConnectionView {
                     ))
                     .into_any_element(),
                 ServerState::Connected(connected) => {
-                    if let Some(view) = connected.active_view() {
-                        view.clone().into_any_element()
+                    if let Some(active_view) = connected.active_view().cloned() {
+                        active_view.into_any_element()
                     } else {
                         debug_panic!("This state should never be reached");
                         div().into_any_element()
                     }
                 }
             })
+    }
+}
+
+impl Item for ConnectionView {
+    type Event = ItemEvent;
+
+    fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
+        if let Some(active_thread) = self.active_thread() {
+            let thread_view = active_thread.read(cx);
+            let title = thread_view.title_editor.read(cx).text(cx);
+            if !title.trim().is_empty() {
+                return title.into();
+            }
+        }
+        self.agent.name()
+    }
+
+    fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
+        let agent_icon = self.agent.logo();
+        let title_text = self.tab_content_text(params.detail.unwrap_or_default(), cx);
+
+        h_flex()
+            .gap_1()
+            .child(Icon::new(agent_icon).color(params.text_color()))
+            .child(
+                Label::new(title_text)
+                    .color(params.text_color())
+            )
+            .into_any_element()
+    }
+
+    fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
+        Some(self.tab_content_text(0, cx))
+    }
+
+    fn clone_on_split(
+        &self,
+        _workspace_id: Option<WorkspaceId>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Task<Option<Entity<Self>>>
+    where
+        Self: Sized,
+    {
+        Task::ready(None)
+    }
+
+    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
+        f(*event)
     }
 }
 
