@@ -47,6 +47,7 @@ pub enum ExtensionProvides {
     IndexedDocsProviders,
     Snippets,
     DebugAdapters,
+    PanelUi,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]

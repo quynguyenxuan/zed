@@ -1,0 +1,24 @@
+package zed:extension;
+
+world panel-ui {
+    /// Inherits all exports and imports from the base extension world.
+    include extension;
+
+    /// GUI host functions provided by Zed.
+    import gui;
+
+    use gui.{theme, ui-event};
+
+    /// Called once when the GUI panel is first shown.
+    export gui-init: func();
+
+    /// Called when the active Zed theme changes.
+    export gui-on-theme-change: func(theme: theme);
+
+    /// Delivers data requested via the `request-data` host function,
+    /// or results from async `call` invocations.
+    export gui-on-data: func(key: string, value: string);
+
+    /// Delivers a UI interaction event from an element with the given source-id.
+    export gui-on-event: func(source-id: string, event: ui-event);
+}

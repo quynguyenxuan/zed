@@ -46,6 +46,13 @@ pub use wit::{
 #[doc(hidden)]
 pub use wit::Guest;
 
+/// Constructs for interacting with the extension GUI panel.
+pub mod gui {
+    pub use crate::wit::zed::extension::gui::{
+        Color, Theme, ThemeColors, UiEvent, call, emit, request_data, set_view,
+    };
+}
+
 /// Constructs for interacting with language servers over the
 /// Language Server Protocol (LSP).
 pub mod lsp {
@@ -259,6 +266,21 @@ pub trait Extension: Send + Sync {
     ) -> Result<DebugRequest, String> {
         Err("`run_dap_locator` not implemented".to_string())
     }
+
+    /// Called once when the GUI panel is first shown.
+    fn gui_init(&mut self) {}
+
+    /// Called when the active Zed theme changes.
+    fn gui_on_theme_change(&mut self, _theme: gui::Theme) {}
+
+    /// Delivers data requested via [`gui::request_data`].
+    fn gui_on_data(&mut self, _key: String, _value: String) {}
+
+    /// Delivers a UI interaction event from an element with the given source ID.
+    fn gui_on_event(&mut self, _source_id: String, _event: gui::UiEvent) {}
+
+    /// Dispatches a named host action. The result is delivered via [`gui::call`].
+    fn gui_call(&mut self, _key: String, _method: String, _params: String) {}
 }
 
 /// Registers the provided type as a Zed extension.
@@ -333,7 +355,8 @@ pub static ZED_API_VERSION: [u8; 6] = *include_bytes!(concat!(env!("OUT_DIR"), "
 mod wit {
     wit_bindgen::generate!({
         skip: ["init-extension"],
-        path: "./wit/since_v0.8.0",
+        path: "./wit/since_v0.9.0",
+        world: "panel-ui",
     });
 }
 
@@ -516,6 +539,22 @@ impl wit::Guest for Component {
         build_task: TaskTemplate,
     ) -> Result<DebugRequest, String> {
         extension().run_dap_locator(locator_name, build_task)
+    }
+
+    fn gui_init() {
+        extension().gui_init();
+    }
+
+    fn gui_on_theme_change(theme: gui::Theme) {
+        extension().gui_on_theme_change(theme);
+    }
+
+    fn gui_on_data(key: String, value: String) {
+        extension().gui_on_data(key, value);
+    }
+
+    fn gui_on_event(source_id: String, event: gui::UiEvent) {
+        extension().gui_on_event(source_id, event);
     }
 }
 

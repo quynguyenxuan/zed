@@ -675,6 +675,24 @@ pub struct NotificationPanelSettingsContent {
 
 #[with_fallible_options]
 #[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct SlintPanelSettingsContent {
+    /// Whether to show the slint panel button in the status bar.
+    ///
+    /// Default: true
+    pub button: Option<bool>,
+    /// Where to dock the slint panel.
+    ///
+    /// Default: right
+    pub dock: Option<DockPosition>,
+    /// Default width of the slint panel in pixels.
+    ///
+    /// Default: 480
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
+    pub default_width: Option<f32>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
 pub struct PanelSettingsContent {
     /// Whether to show the panel button in the status bar.
     ///

@@ -119,6 +119,8 @@ pub struct ExtensionManifest {
     pub debug_locators: BTreeMap<Arc<str>, DebugLocatorManifestEntry>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub language_model_providers: BTreeMap<Arc<str>, LanguageModelProviderManifestEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel_ui: Option<ExtensionGuiManifest>,
 }
 
 impl ExtensionManifest {
@@ -159,6 +161,10 @@ impl ExtensionManifest {
 
         if !self.debug_adapters.is_empty() {
             provides.insert(ExtensionProvides::DebugAdapters);
+        }
+
+        if self.panel_ui.is_some() {
+            provides.insert(ExtensionProvides::PanelUi);
         }
 
         provides
@@ -366,6 +372,15 @@ pub struct LanguageModelProviderManifestEntry {
     pub icon: Option<String>,
 }
 
+/// Manifest entry for an extension that provides a GUI panel.
+/// When present, the extension's WASM module must export the `gui-*` functions
+/// defined in the `extension-with-gui` WIT world.
+#[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
+pub struct ExtensionGuiManifest {
+    /// The minimum Zed API version required for GUI support (e.g., "0.9.0").
+    pub min_zed_api: String,
+}
+
 impl ExtensionManifest {
     pub async fn load(fs: Arc<dyn Fs>, extension_dir: &Path) -> Result<Self> {
         let extension_name = extension_dir
@@ -437,6 +452,7 @@ fn manifest_from_old_manifest(
         debug_adapters: Default::default(),
         debug_locators: Default::default(),
         language_model_providers: Default::default(),
+        panel_ui: None,
     }
 }
 
@@ -471,6 +487,7 @@ mod tests {
             debug_adapters: Default::default(),
             debug_locators: Default::default(),
             language_model_providers: BTreeMap::default(),
+            panel_ui: None,
         }
     }
 

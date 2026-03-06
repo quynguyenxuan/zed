@@ -493,6 +493,20 @@ pub struct WasmState {
     ctx: wasi::WasiCtx,
     pub host: Arc<WasmHost>,
     pub(crate) capability_granter: CapabilityGranter,
+    pub(crate) gui_panel_tx: Option<mpsc::UnboundedSender<GuiPanelMessage>>,
+}
+
+pub enum GuiPanelMessage {
+    SetView(String),
+    Emit { name: String, data: String },
+    RequestData(String),
+    Call { key: String, method: String, params: String },
+}
+
+impl WasmState {
+    pub fn set_gui_panel_tx(&mut self, tx: mpsc::UnboundedSender<GuiPanelMessage>) {
+        self.gui_panel_tx = Some(tx);
+    }
 }
 
 type MainThreadCall = Box<dyn Send + for<'a> FnOnce(&'a mut AsyncApp) -> LocalBoxFuture<'a, ()>>;
@@ -626,6 +640,7 @@ impl WasmHost {
                         this.granted_capabilities.clone(),
                         manifest.clone(),
                     ),
+                    gui_panel_tx: None,
                 },
             );
             // Store will yield after 1 tick, and get a new deadline of 1 tick after each yield.
@@ -638,6 +653,7 @@ impl WasmHost {
                 this.release_channel,
                 zed_api_version.clone(),
                 &component,
+                manifest.panel_ui.is_some(),
             )
             .await?;
 
@@ -856,6 +872,18 @@ impl WasmExtension {
                 self.manifest.name, self.manifest.id,
             )
         })
+    }
+
+    pub async fn inject_gui_panel_tx(
+        &self,
+        tx: mpsc::UnboundedSender<GuiPanelMessage>,
+    ) -> Result<()> {
+        self.call(move |_ext, store| {
+            Box::pin(async move {
+                store.data_mut().set_gui_panel_tx(tx);
+            })
+        })
+        .await
     }
 }
 

@@ -1,0 +1,65 @@
+package zed:extension;
+
+interface gui {
+
+    // ── Theme ─────────────────────────────────────────────────────────────
+
+    record color { r: u8, g: u8, b: u8, a: u8 }
+
+    record theme-colors {
+        background:                  color,
+        editor-background:           color,
+        surface-background:          color,
+        elevated-surface-background: color,
+        text:                        color,
+        text-muted:                  color,
+        text-disabled:               color,
+        text-accent:                 color,
+        border:                      color,
+        border-muted:                color,
+        border-focused:              color,
+        element-background:          color,
+        element-hover:               color,
+        element-selected:            color,
+        element-active:              color,
+        element-disabled:            color,
+        panel-background:            color,
+        status-error:                color,
+        status-warning:              color,
+        status-success:              color,
+        status-info:                 color,
+    }
+
+    record theme {
+        name:    string,
+        is-dark: bool,
+        colors:  theme-colors,
+    }
+
+    // ── Events ────────────────────────────────────────────────────────────
+
+    variant ui-event {
+        clicked,
+        input-changed(string),
+        select-changed(string),
+        checkbox-changed(bool),
+        row-selected(string),
+    }
+
+    // ── Host functions (provided by Zed, called by WASM) ─────────────────
+
+    /// Updates the panel UI. The view-json is a JSON-encoded element tree.
+    /// See the Zed extension documentation for the element schema.
+    set-view: func(view-json: string);
+
+    /// Emits a named event to Zed for forwarding to the extension's logic callbacks.
+    emit: func(name: string, data: string);
+
+    /// Requests data from the host; the result is delivered via the gui-on-data export.
+    request-data: func(key: string);
+
+    /// Dispatches a named host action asynchronously.
+    /// The result is delivered via gui-on-data(key, result-json).
+    /// Returns an error immediately if the method name is not in the allowed set.
+    call: func(key: string, method: string, params: string) -> result<_, string>;
+}

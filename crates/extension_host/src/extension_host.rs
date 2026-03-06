@@ -141,6 +141,7 @@ pub enum Event {
     ExtensionInstalled(Arc<str>),
     ExtensionUninstalled(Arc<str>),
     ExtensionFailedToLoad(Arc<str>),
+    GuiExtensionLoaded(Arc<ExtensionManifest>, WasmExtension),
 }
 
 impl EventEmitter<Event> for ExtensionStore {}
@@ -1477,6 +1478,13 @@ impl ExtensionStore {
                     for debug_adapter in manifest.debug_locators.keys() {
                         this.proxy
                             .register_debug_locator(extension.clone(), debug_adapter.clone());
+                    }
+
+                    if manifest.panel_ui.is_some() {
+                        cx.emit(Event::GuiExtensionLoaded(
+                            manifest.clone(),
+                            wasm_extension.clone(),
+                        ));
                     }
                 }
 

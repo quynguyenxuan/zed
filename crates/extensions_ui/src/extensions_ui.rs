@@ -194,6 +194,7 @@ fn extension_provides_label(provides: ExtensionProvides) -> &'static str {
         ExtensionProvides::IndexedDocsProviders => "Indexed Docs Providers",
         ExtensionProvides::Snippets => "Snippets",
         ExtensionProvides::DebugAdapters => "Debug Adapters",
+        ExtensionProvides::PanelUi => "Panel UI",
     }
 }
 
