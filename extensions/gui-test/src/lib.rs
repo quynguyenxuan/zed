@@ -32,6 +32,9 @@ impl GuiTest {
 impl Extension for GuiTest {
     fn new() -> Self {
         register_command("open-panel", "open panel");
+        register_command("clear-result", "clear result");
+        register_command("get-open-files", "get open files");
+        register_command("get-selection", "get selection");
         GuiTest {
             result_text: "Click a button to call a host action.".to_string(),
         }
@@ -51,6 +54,25 @@ impl Extension for GuiTest {
     fn run_extension_command(&mut self, command_id: &str) -> Result<(), String> {
         match command_id {
             "open-panel" => Ok(()),
+            "clear-result" => {
+                self.result_text = String::new();
+                self.render();
+                Ok(())
+            }
+            "get-open-files" => {
+                if let Err(err) = gui::call("get-open-files", "workspace.open_files", "{}") {
+                    self.result_text = format!("error: {err}");
+                    self.render();
+                }
+                Ok(())
+            }
+            "get-selection" => {
+                if let Err(err) = gui::call("get-selection", "editor.get_selection", "{}") {
+                    self.result_text = format!("error: {err}");
+                    self.render();
+                }
+                Ok(())
+            }
             _ => Err(format!("unknown command: {command_id}")),
         }
     }
