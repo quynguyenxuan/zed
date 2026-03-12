@@ -17,7 +17,7 @@ pub use serde_json;
 pub use wit::{
     CodeLabel, CodeLabelSpan, CodeLabelSpanLiteral, Command, DownloadedFileType, EnvVars,
     KeyValueStore, LanguageServerInstallationStatus, Project, Range, Worktree, download_file,
-    make_file_executable,
+    make_file_executable, register_command,
     zed::extension::context_server::ContextServerConfiguration,
     zed::extension::dap::{
         AttachRequest, BuildTaskDefinition, BuildTaskDefinitionTemplatePayload, BuildTaskTemplate,
@@ -300,6 +300,11 @@ pub trait Extension: Send + Sync {
 
     /// Delivers a UI interaction event from an element with the given source ID.
     fn gui_on_event(&mut self, _source_id: String, _event: gui::UiEvent) {}
+
+    /// Called when the user invokes a command previously registered via [`register_command`].
+    fn run_extension_command(&mut self, _command_id: &str) -> Result<(), String> {
+        Ok(())
+    }
 
     /// Dispatches a named host action. The result is delivered via [`gui::call`].
     fn gui_call(&mut self, _key: String, _method: String, _params: String) {}
@@ -597,6 +602,10 @@ impl wit::Guest for Component {
 
     fn gui_on_event(source_id: String, event: gui::UiEvent) {
         extension().gui_on_event(source_id, event);
+    }
+
+    fn run_extension_command(command_id: String) -> Result<(), String> {
+        extension().run_extension_command(&command_id)
     }
 }
 
