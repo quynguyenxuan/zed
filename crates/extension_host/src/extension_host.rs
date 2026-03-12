@@ -143,6 +143,11 @@ pub enum Event {
     ExtensionUninstalled(Arc<str>),
     ExtensionFailedToLoad(Arc<str>),
     GuiExtensionLoaded(Arc<ExtensionManifest>, WasmExtension),
+    ExtensionCommandRegistered {
+        extension_id: Arc<str>,
+        display_name: String,
+        command_id: Arc<str>,
+    },
 }
 
 impl EventEmitter<Event> for ExtensionStore {}
@@ -252,6 +257,8 @@ impl ExtensionStore {
 
         let (reload_tx, mut reload_rx) = unbounded();
         let (connection_registered_tx, mut connection_registered_rx) = unbounded();
+        let (command_tx, mut command_rx) =
+            unbounded::<(Arc<str>, String, Arc<str>)>();
         let mut this = Self {
             proxy: extension_host_proxy.clone(),
             extension_index: Default::default(),
@@ -267,6 +274,7 @@ impl ExtensionStore {
                 node_runtime,
                 extension_host_proxy,
                 work_dir,
+                command_tx,
                 cx,
             ),
             wasm_extensions: Vec::new(),
@@ -396,6 +404,19 @@ impl ExtensionStore {
                         }
                     }
                 }
+            }
+        }));
+
+        this.tasks.push(cx.spawn(async move |this, cx| {
+            while let Some((extension_id, display_name, command_id)) = command_rx.next().await {
+                this.update(cx, |_, cx| {
+                    cx.emit(Event::ExtensionCommandRegistered {
+                        extension_id,
+                        display_name,
+                        command_id,
+                    });
+                })
+                .ok();
             }
         }));
 

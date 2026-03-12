@@ -51,6 +51,7 @@ impl HeadlessExtensionStore {
                 node_runtime,
                 extension_host_proxy.clone(),
                 extension_dir.join("work"),
+                futures::channel::mpsc::unbounded::<(Arc<str>, String, Arc<str>)>().0,
                 cx,
             ),
             extension_dir,

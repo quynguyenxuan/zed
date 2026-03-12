@@ -226,6 +226,20 @@ impl PanelUiImports for WasmState {
         )
         .await
     }
+
+    async fn register_command(&mut self, id: String, label: String) -> wasmtime::Result<()> {
+        let extension_id = self.manifest.id.clone();
+        let display_name = format!(
+            "{}: {}",
+            self.manifest.name.to_lowercase().replace(' ', "_"),
+            label
+        );
+        self.host
+            .command_registrations_tx
+            .unbounded_send((extension_id, display_name, id.into()))
+            .ok();
+        Ok(())
+    }
 }
 
 impl gui::Host for WasmState {

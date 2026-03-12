@@ -57,6 +57,7 @@ pub struct WasmHost {
     pub(crate) granted_capabilities: Vec<ExtensionCapability>,
     _main_thread_message_task: Task<()>,
     main_thread_message_tx: mpsc::UnboundedSender<MainThreadCall>,
+    pub(crate) command_registrations_tx: mpsc::UnboundedSender<(Arc<str>, String, Arc<str>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -619,6 +620,7 @@ impl WasmHost {
         node_runtime: NodeRuntime,
         proxy: Arc<ExtensionHostProxy>,
         work_dir: PathBuf,
+        command_registrations_tx: mpsc::UnboundedSender<(Arc<str>, String, Arc<str>)>,
         cx: &mut App,
     ) -> Arc<Self> {
         let (tx, mut rx) = mpsc::unbounded::<MainThreadCall>();
@@ -641,6 +643,7 @@ impl WasmHost {
             granted_capabilities: extension_settings.granted_capabilities.clone(),
             _main_thread_message_task: task,
             main_thread_message_tx: tx,
+            command_registrations_tx,
         })
     }
 
@@ -926,6 +929,41 @@ impl WasmExtension {
             })
         })
         .await
+    }
+
+    pub async fn call_gui_init(&self) -> Result<()> {
+        self.call(|ext, store| {
+            async move { ext.call_gui_init(store).await }.boxed()
+        })
+        .await?
+    }
+
+    pub async fn call_gui_on_theme_change(
+        &self,
+        theme: wit::since_v0_9_0::gui::Theme,
+    ) -> Result<()> {
+        self.call(move |ext, store| {
+            async move { ext.call_gui_on_theme_change(store, theme).await }.boxed()
+        })
+        .await?
+    }
+
+    pub async fn call_gui_on_data(&self, key: String, value: String) -> Result<()> {
+        self.call(move |ext, store| {
+            async move { ext.call_gui_on_data(store, &key, &value).await }.boxed()
+        })
+        .await?
+    }
+
+    pub async fn call_gui_on_event(
+        &self,
+        source_id: String,
+        event: wit::since_v0_9_0::gui::UiEvent,
+    ) -> Result<()> {
+        self.call(move |ext, store| {
+            async move { ext.call_gui_on_event(store, &source_id, event).await }.boxed()
+        })
+        .await?
     }
 }
 
