@@ -12,6 +12,7 @@ use workspace::Workspace;
 /// Initializes the command palette hooks.
 pub fn init(cx: &mut App) {
     cx.set_global(GlobalCommandPaletteFilter::default());
+    cx.set_global(GlobalDynamicCommandRegistry::default());
 }
 
 /// A filter for the command palette.
@@ -151,3 +152,43 @@ impl GlobalCommandPaletteInterceptor {
         Some(handler(query, workspace, cx))
     }
 }
+
+/// A command dynamically registered at runtime by an extension.
+pub struct DynamicCommand {
+    /// Display name shown in the command palette (e.g. `"gui_test: open panel"`).
+    pub name: String,
+    /// Extension that registered this command, used to bulk-unregister on extension unload.
+    pub extension_id: std::sync::Arc<str>,
+    /// Opaque identifier passed back to the extension via `run-extension-command`.
+    pub command_id: std::sync::Arc<str>,
+}
+
+/// Registry of commands dynamically registered by extensions at runtime.
+#[derive(Default)]
+pub struct DynamicCommandRegistry {
+    commands: Vec<DynamicCommand>,
+}
+
+impl DynamicCommandRegistry {
+    /// Registers a new dynamic command.
+    pub fn register(&mut self, command: DynamicCommand) {
+        self.commands.push(command);
+    }
+
+    /// Removes all commands registered by the given extension.
+    pub fn unregister_extension(&mut self, extension_id: &str) {
+        self.commands
+            .retain(|c| c.extension_id.as_ref() != extension_id);
+    }
+
+    /// Iterates over all registered dynamic commands.
+    pub fn commands(&self) -> impl Iterator<Item = &DynamicCommand> {
+        self.commands.iter()
+    }
+}
+
+/// Global wrapper for [`DynamicCommandRegistry`], stored in the GPUI app context.
+#[derive(Default)]
+pub struct GlobalDynamicCommandRegistry(pub DynamicCommandRegistry);
+
+impl Global for GlobalDynamicCommandRegistry {}
