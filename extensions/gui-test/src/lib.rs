@@ -1,4 +1,4 @@
-use zed_extension_api::{Extension, gui, serde_json};
+use zed_extension_api::{Extension, gui, register_command, serde_json};
 
 struct GuiTest {
     result_text: String,
@@ -31,6 +31,7 @@ impl GuiTest {
 
 impl Extension for GuiTest {
     fn new() -> Self {
+        register_command("open-panel", "open panel");
         GuiTest {
             result_text: "Click a button to call a host action.".to_string(),
         }
@@ -45,6 +46,13 @@ impl Extension for GuiTest {
     fn gui_on_data(&mut self, key: String, value: String) {
         self.result_text = format!("[{key}] {value}");
         self.render();
+    }
+
+    fn run_extension_command(&mut self, command_id: &str) -> Result<(), String> {
+        match command_id {
+            "open-panel" => Ok(()),
+            _ => Err(format!("unknown command: {command_id}")),
+        }
     }
 
     fn gui_on_event(&mut self, source_id: String, event: gui::UiEvent) {
