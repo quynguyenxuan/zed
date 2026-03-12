@@ -35,6 +35,9 @@ impl Extension for GuiTest {
         register_command("clear-result", "clear result");
         register_command("get-open-files", "get open files");
         register_command("get-selection", "get selection");
+        register_command("test-request-data", "test request data");
+        register_command("test-emit", "test emit");
+        register_command("test-error", "test error");
         GuiTest {
             result_text: "Click a button to call a host action.".to_string(),
         }
@@ -73,6 +76,22 @@ impl Extension for GuiTest {
                 }
                 Ok(())
             }
+            // Tests gui::request_data — host returns "null", delivered via gui_on_data callback.
+            "test-request-data" => {
+                self.result_text = "waiting for request-data response…".to_string();
+                self.render();
+                gui::request_data("req-test");
+                Ok(())
+            }
+            // Tests gui::emit — currently a no-op on the host, but verifies the call compiles and runs.
+            "test-emit" => {
+                gui::emit("test-event", r#"{"source":"command-palette"}"#);
+                self.result_text = "emit sent (check host logs)".to_string();
+                self.render();
+                Ok(())
+            }
+            // Returns an error to exercise the error propagation path in run-extension-command.
+            "test-error" => Err("intentional test error from run-extension-command".to_string()),
             _ => Err(format!("unknown command: {command_id}")),
         }
     }
