@@ -416,47 +416,6 @@ pub fn initialize_workspace(
         })
         .detach();
 
-        {
-            let extension_store = ExtensionStore::global(cx);
-            cx.subscribe_in(
-                &extension_store,
-                window,
-                |workspace, _, event, window, cx| {
-                    if let extension_host::Event::GuiExtensionLoaded(manifest, wasm_extension) =
-                        event
-                    {
-                        if let Some(panel) = workspace.panel::<ExtensionGuiPanel>(cx) {
-                            let manifest = manifest.clone();
-                            let wasm_extension = wasm_extension.clone();
-                            cx.spawn_in(window, async move |_, cx| {
-                                panel
-                                    .update_in(cx, |panel, window, cx| {
-                                        panel.add_view(manifest, wasm_extension, window, cx);
-                                    })
-                                    .ok();
-                            })
-                            .detach();
-                        } else {
-                            let project = workspace.project().clone();
-                            let workspace_handle = workspace.weak_handle();
-                            let panel = cx.new(|cx| {
-                                ExtensionGuiPanel::new(
-                                    manifest.clone(),
-                                    wasm_extension.clone(),
-                                    workspace_handle,
-                                    project,
-                                    window,
-                                    cx,
-                                )
-                            });
-                            workspace.add_panel(panel, window, cx);
-                        }
-                    }
-                },
-            )
-            .detach();
-        }
-
         #[cfg(not(any(test, target_os = "macos")))]
         initialize_file_watcher(window, cx);
 
@@ -668,6 +627,8 @@ fn initialize_panels(
             cx.clone(),
         );
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
+        let extension_panel =
+            ExtensionGuiPanel::load(workspace_handle.clone(), cx.clone());
         async fn add_panel_when_ready(
             panel_task: impl Future<Output = anyhow::Result<Entity<impl workspace::Panel>>> + 'static,
             workspace_handle: WeakEntity<Workspace>,
@@ -691,6 +652,7 @@ fn initialize_panels(
             add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(notification_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(extension_panel, workspace_handle.clone(), cx.clone()),
             initialize_agent_panel(workspace_handle, prompt_builder, cx.clone()).map(|r| r.log_err()),
         );
 
@@ -1072,14 +1034,6 @@ fn register_actions(
              window: &mut Window,
              cx: &mut Context<Workspace>| {
                 workspace.toggle_panel_focus::<TerminalPanel>(window, cx);
-            },
-        )
-        .register_action(
-            |workspace: &mut Workspace,
-             _: &extension_panel::ToggleFocus,
-             window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                workspace.toggle_panel_focus::<ExtensionGuiPanel>(window, cx);
             },
         )
         .register_action({
@@ -5112,6 +5066,7 @@ mod tests {
             workspace::init(app_state.clone(), cx);
             release_channel::init(Version::new(0, 0, 0), cx);
             command_palette::init(cx);
+            extension_panel::init(cx);
             editor::init(cx);
             collab_ui::init(&app_state, cx);
             git_ui::init(cx);
