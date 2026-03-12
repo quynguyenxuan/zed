@@ -392,7 +392,6 @@ fn render_element(element: &ViewElement, entity: WeakEntity<ExtensionGuiView>) -
         ViewElement::Button { source_id, label } => {
             let button_source_id = source_id.clone().or(label.clone()).unwrap_or_default();
             let button_label = label.clone().unwrap_or_default();
-            let entity_for_click = entity.clone();
 
             ui::Button::new(
                 SharedString::from(format!("ext-btn-{}", button_source_id)),
@@ -400,7 +399,7 @@ fn render_element(element: &ViewElement, entity: WeakEntity<ExtensionGuiView>) -
             )
             .on_click(move |_, _window, cx| {
                 let button_source_id = button_source_id.clone();
-                entity_for_click.update(cx, |view, cx| {
+                entity.update(cx, |view, cx| {
                     let wasm_extension = view.wasm_extension.clone();
                     cx.spawn(async move |_, _| {
                         use extension_host::wasm_host::wit::since_v0_9_0::gui::UiEvent;

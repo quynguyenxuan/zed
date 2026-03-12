@@ -111,6 +111,7 @@ fn wasm_host(cx: &TestAppContext, extensions_dir: &TempTree) -> Arc<WasmHost> {
             NodeRuntime::unavailable(),
             Arc::new(ExtensionHostProxy::new()),
             work_dir,
+            futures::channel::mpsc::unbounded().0,
             cx,
         )
     })

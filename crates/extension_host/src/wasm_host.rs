@@ -1117,6 +1117,7 @@ mod tests {
                 NodeRuntime::unavailable(),
                 Arc::new(ExtensionHostProxy::default()),
                 PathBuf::from("/work"),
+                futures::channel::mpsc::unbounded().0,
                 cx,
             )
         });
