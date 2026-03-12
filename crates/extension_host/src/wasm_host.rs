@@ -965,6 +965,18 @@ impl WasmExtension {
         })
         .await?
     }
+
+    pub async fn call_run_extension_command(&self, command_id: String) -> Result<()> {
+        self.call(move |ext, store| {
+            async move {
+                ext.call_run_extension_command(store, &command_id)
+                    .await?
+                    .map_err(|e| anyhow::anyhow!(e))
+            }
+            .boxed()
+        })
+        .await?
+    }
 }
 
 impl WasmState {

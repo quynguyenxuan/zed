@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use command_palette_hooks::{DynamicCommand, GlobalDynamicCommandRegistry};
 use extension_host::{
-    ExtensionManifest,
+    ExtensionManifest, ExtensionStore,
     wasm_host::{GuiPanelMessage, WasmExtension},
 };
 use futures::{StreamExt as _, channel::mpsc};
@@ -217,9 +218,12 @@ impl ExtensionGuiPanel {
         });
     }
 
+    /// Opens the extension in a new tab, or focuses the existing tab if already open.
+    /// Emits `PanelEvent::Activate` to make the panel visible.
     pub fn open_or_focus(
         &mut self,
-        extension_id: &str,
+        manifest: Arc<ExtensionManifest>,
+        wasm_extension: WasmExtension,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -230,14 +234,17 @@ impl ExtensionGuiPanel {
             .enumerate()
             .find_map(|(ix, item)| {
                 item.downcast::<ExtensionGuiView>()
-                    .filter(|view| view.read(cx).extension_id.as_ref() == extension_id)
+                    .filter(|view| view.read(cx).extension_id == manifest.id)
                     .map(|_| ix)
             });
         if let Some(ix) = existing_ix {
             self.active_pane.update(cx, |pane, cx| {
                 pane.activate_item(ix, true, true, window, cx);
             });
+        } else {
+            self.add_view(manifest, wasm_extension, window, cx);
         }
+        cx.emit(PanelEvent::Activate);
     }
 }
 
@@ -409,4 +416,93 @@ fn render_element(element: &ViewElement, entity: WeakEntity<ExtensionGuiView>) -
         ViewElement::Divider => gpui::div().w_full().h(gpui::px(1.0)).into_any_element(),
         ViewElement::Unknown => gpui::div().into_any_element(),
     }
+}
+
+/// Registers `ExtensionGuiPanel` actions and subscribes to `ExtensionStore` events so that:
+/// - Commands registered by WASM extensions appear in the command palette.
+/// - GUI extensions get a tab added when they load.
+/// - `OpenExtensionPanel` dispatches open the correct extension tab and invoke the WASM handler.
+pub fn init(cx: &mut App) {
+    cx.observe_new(
+        |workspace: &mut Workspace, window: Option<&mut Window>, cx: &mut Context<Workspace>| {
+            workspace
+                .register_action(|workspace, _: &ToggleFocus, window, cx| {
+                    workspace.toggle_panel_focus::<ExtensionGuiPanel>(window, cx);
+                })
+                .register_action(|workspace, action: &OpenExtensionPanel, window, cx| {
+                    let extension_id = action.extension_id.clone();
+                    let command_id = action.command_id.clone();
+                    let wasm = ExtensionStore::global(cx)
+                        .read(cx)
+                        .wasm_extension_for_id(&extension_id);
+                    if let Some(panel) = workspace.panel::<ExtensionGuiPanel>(cx) {
+                        if let Some((manifest, wasm_extension)) = wasm {
+                            cx.spawn_in(window, async move |_, cx| {
+                                panel
+                                    .update_in(cx, |panel, window, cx| {
+                                        panel.open_or_focus(
+                                            manifest,
+                                            wasm_extension.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                    .ok();
+                                wasm_extension
+                                    .call_run_extension_command(command_id)
+                                    .await
+                                    .log_err();
+                            })
+                            .detach();
+                        } else {
+                            workspace.toggle_panel_focus::<ExtensionGuiPanel>(window, cx);
+                        }
+                    }
+                });
+
+            let Some(window) = window else { return };
+            let extension_store = ExtensionStore::global(cx);
+            cx.subscribe_in(
+                &extension_store,
+                window,
+                |workspace, _, event, window, cx| match event {
+                    extension_host::Event::GuiExtensionLoaded(manifest, wasm_extension) => {
+                        if let Some(panel) = workspace.panel::<ExtensionGuiPanel>(cx) {
+                            let manifest = manifest.clone();
+                            let wasm_extension = wasm_extension.clone();
+                            cx.spawn_in(window, async move |_, cx| {
+                                panel
+                                    .update_in(cx, |panel, window, cx| {
+                                        panel.add_view(manifest, wasm_extension, window, cx);
+                                    })
+                                    .ok();
+                            })
+                            .detach();
+                        }
+                    }
+                    extension_host::Event::ExtensionCommandRegistered {
+                        extension_id,
+                        display_name,
+                        command_id,
+                    } => {
+                        cx.update_global(|registry: &mut GlobalDynamicCommandRegistry, _| {
+                            registry.0.register(DynamicCommand {
+                                name: display_name.clone(),
+                                extension_id: extension_id.clone(),
+                                command_id: command_id.clone(),
+                            });
+                        });
+                    }
+                    extension_host::Event::ExtensionUninstalled(extension_id) => {
+                        cx.update_global(|registry: &mut GlobalDynamicCommandRegistry, _| {
+                            registry.0.unregister_extension(extension_id);
+                        });
+                    }
+                    _ => {}
+                },
+            )
+            .detach();
+        },
+    )
+    .detach();
 }

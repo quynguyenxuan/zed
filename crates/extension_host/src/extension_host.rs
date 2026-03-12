@@ -239,6 +239,17 @@ impl ExtensionStore {
         cx.global::<GlobalExtensionStore>().0.clone()
     }
 
+    /// Returns the loaded WASM extension and its manifest for the given extension ID, if found.
+    pub fn wasm_extension_for_id(
+        &self,
+        extension_id: &str,
+    ) -> Option<(Arc<ExtensionManifest>, WasmExtension)> {
+        self.wasm_extensions
+            .iter()
+            .find(|(manifest, _)| manifest.id.as_ref() == extension_id)
+            .map(|(manifest, wasm)| (manifest.clone(), wasm.clone()))
+    }
+
     pub fn new(
         extensions_dir: PathBuf,
         build_dir: Option<PathBuf>,

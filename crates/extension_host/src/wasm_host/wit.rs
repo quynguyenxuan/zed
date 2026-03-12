@@ -138,7 +138,7 @@ impl Extension {
                 let extension = latest::Extension::instantiate_async(
                     store,
                     component,
-                    latest::linker(executor),
+                    since_v0_9_0::linker_with_gui(executor),
                 )
                 .await
                 .context("failed to instantiate wasm extension")?;
@@ -518,6 +518,7 @@ impl Extension {
         resource: Resource<Arc<dyn WorktreeDelegate>>,
     ) -> Result<Option<String>> {
         match self {
+            Extension::V0_9_0(_) => Ok(None),
             Extension::V0_8_0(ext) => {
                 ext.call_language_server_initialization_options_schema(
                     store,
@@ -545,6 +546,7 @@ impl Extension {
         resource: Resource<Arc<dyn WorktreeDelegate>>,
     ) -> Result<Option<String>> {
         match self {
+            Extension::V0_9_0(_) => Ok(None),
             Extension::V0_8_0(ext) => {
                 ext.call_language_server_workspace_configuration_schema(
                     store,
@@ -1425,6 +1427,61 @@ impl Extension {
             | Extension::V0_0_1(_) => {
                 anyhow::bail!("`run_dap_locator` not available prior to v0.6.0");
             }
+        }
+    }
+
+    pub async fn call_gui_init(&self, store: &mut Store<WasmState>) -> Result<()> {
+        match self {
+            Extension::V0_9_0(ext) => ext.call_gui_init(store).await,
+            _ => Ok(()),
+        }
+    }
+
+    pub async fn call_gui_on_theme_change(
+        &self,
+        store: &mut Store<WasmState>,
+        theme: since_v0_9_0::gui::Theme,
+    ) -> Result<()> {
+        match self {
+            Extension::V0_9_0(ext) => ext.call_gui_on_theme_change(store, &theme).await,
+            _ => Ok(()),
+        }
+    }
+
+    pub async fn call_gui_on_data(
+        &self,
+        store: &mut Store<WasmState>,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
+        match self {
+            Extension::V0_9_0(ext) => ext.call_gui_on_data(store, key, value).await,
+            _ => Ok(()),
+        }
+    }
+
+    pub async fn call_gui_on_event(
+        &self,
+        store: &mut Store<WasmState>,
+        source_id: &str,
+        event: since_v0_9_0::gui::UiEvent,
+    ) -> Result<()> {
+        match self {
+            Extension::V0_9_0(ext) => ext.call_gui_on_event(store, source_id, &event).await,
+            _ => Ok(()),
+        }
+    }
+
+    pub async fn call_run_extension_command(
+        &self,
+        store: &mut Store<WasmState>,
+        command_id: &str,
+    ) -> Result<Result<(), String>> {
+        match self {
+            Extension::V0_9_0(ext) => {
+                ext.call_run_extension_command(store, command_id).await
+            }
+            _ => Ok(Ok(())),
         }
     }
 }
