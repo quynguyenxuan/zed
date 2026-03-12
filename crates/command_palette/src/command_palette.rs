@@ -10,7 +10,7 @@ use std::{
 use client::parse_zed_link;
 use command_palette_hooks::{
     CommandInterceptItem, CommandInterceptResult, CommandPaletteFilter,
-    GlobalCommandPaletteInterceptor,
+    GlobalCommandPaletteInterceptor, GlobalDynamicCommandRegistry,
 };
 
 use fuzzy::{StringMatch, StringMatchCandidate};
@@ -98,7 +98,7 @@ impl CommandPalette {
     ) -> Self {
         let filter = CommandPaletteFilter::try_global(cx);
 
-        let commands = window
+        let mut commands: Vec<Command> = window
             .available_actions(cx)
             .into_iter()
             .filter_map(|action| {
@@ -112,6 +112,17 @@ impl CommandPalette {
                 })
             })
             .collect();
+
+        if let Some(registry) = cx.try_global::<GlobalDynamicCommandRegistry>() {
+            commands.extend(registry.0.commands().map(|cmd| Command {
+                name: cmd.name.clone(),
+                action: Box::new(extension_panel::OpenExtensionPanel {
+                    extension_id: cmd.extension_id.to_string(),
+                    command_id: cmd.command_id.to_string(),
+                }),
+            }));
+        }
+        let commands = commands;
 
         let delegate = CommandPaletteDelegate::new(
             cx.entity().downgrade(),
