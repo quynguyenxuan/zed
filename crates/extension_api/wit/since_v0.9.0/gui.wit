@@ -2,8 +2,11 @@ package zed:extension;
 
 interface gui {
 
+    use ui-elements.{ui-tree};
+
     // ── Theme ─────────────────────────────────────────────────────────────
 
+    // RGBA color used for theme color values delivered to the extension.
     record color { r: u8, g: u8, b: u8, a: u8 }
 
     record theme-colors {
@@ -38,19 +41,83 @@ interface gui {
 
     // ── Events ────────────────────────────────────────────────────────────
 
+    record mouse-event-data {
+        x:           f32,
+        y:           f32,
+        // 0=left, 1=right, 2=middle
+        button:      u8,
+        click-count: u32,
+        shift:       bool,
+        ctrl:        bool,
+        alt:         bool,
+        meta:        bool,
+    }
+
+    record key-event-data {
+        // Key name, e.g. "Enter", "a", "ArrowDown".
+        key:    string,
+        shift:  bool,
+        ctrl:   bool,
+        alt:    bool,
+        meta:   bool,
+        repeat: bool,
+    }
+
+    record scroll-event-data {
+        delta-x: f32,
+        delta-y: f32,
+        // true when coming from a trackpad (precise scrolling).
+        precise: bool,
+    }
+
     variant ui-event {
-        clicked,
+        // Mouse
+        clicked(mouse-event-data),
+        double-clicked(mouse-event-data),
+        right-clicked(mouse-event-data),
+        mouse-down(mouse-event-data),
+        mouse-up(mouse-event-data),
+        mouse-moved(mouse-event-data),
+        // Hover
+        hover-start,
+        hover-end,
+        // Scroll
+        scroll-wheel(scroll-event-data),
+        // Keyboard
+        key-down(key-event-data),
+        key-up(key-event-data),
+        // Focus
+        focus-gained,
+        focus-lost,
+        // Input element value changed.
         input-changed(string),
-        select-changed(string),
-        checkbox-changed(bool),
-        row-selected(string),
+        // Drag/drop
+        drag-started,
+        // Serialized drag payload.
+        dropped(string),
     }
 
     // ── Host functions (provided by Zed, called by WASM) ─────────────────
 
-    /// Updates the panel UI. The view-json is a JSON-encoded element tree.
-    /// See the Zed extension documentation for the element schema.
+    /// Updates the panel UI using a JSON-encoded element tree (legacy).
+    /// Prefer set-view-tree for new extensions.
     set-view: func(view-json: string);
+
+    /// Replaces the extension panel's element tree with a structured WIT tree.
+    /// The host renders the tree using native GPUI elements.
+    /// Calling this is optional — the host also calls gui-render after each
+    /// event to pull the latest tree from the extension.
+    set-view-tree: func(tree: ui-tree);
+
+    /// Creates a focus handle managed by the host. Returns an opaque integer
+    /// ID. Pass it in div-node.focus-handle-id to make that element focusable.
+    create-focus-handle: func() -> u32;
+
+    /// Requests keyboard focus for the given focus handle.
+    request-focus: func(handle-id: u32);
+
+    /// Releases focus handle resources when no longer needed.
+    drop-focus-handle: func(handle-id: u32);
 
     /// Emits a named event to Zed for forwarding to the extension's logic callbacks.
     emit: func(name: string, data: string);

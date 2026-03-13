@@ -1,18 +1,20 @@
+mod ui_renderer;
+
 use std::sync::Arc;
 
 use anyhow::Result;
 use command_palette_hooks::{DynamicCommand, GlobalDynamicCommandRegistry};
 use extension_host::{
     ExtensionManifest, ExtensionStore,
-    wasm_host::{GuiPanelMessage, WasmExtension},
+    wasm_host::{WasmExtension, wit},
 };
-use futures::{StreamExt as _, channel::mpsc};
 use gpui::{
-    Action, AnyElement, App, AsyncWindowContext, Context, EventEmitter, FocusHandle, Focusable,
-    IntoElement, Pixels, Render, SharedString, Task, WeakEntity, Window, actions, px,
+    Action, App, AsyncWindowContext, Context, EventEmitter, FocusHandle, Focusable,
+    IntoElement, Pixels, Render, SharedString, WeakEntity, Window, actions, px,
 };
 use project::Project;
 use serde::{Deserialize, Serialize};
+use settings::SettingsStore;
 use ui::{IconName, prelude::*};
 use util::ResultExt as _;
 use workspace::{
@@ -38,104 +40,39 @@ pub struct OpenExtensionPanel {
     pub command_id: String,
 }
 
-/// A JSON-decodable element tree sent by a WASM GUI extension via `gui::set-view`.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ViewElement {
-    VFlex { children: Vec<ViewElement> },
-    HFlex { children: Vec<ViewElement> },
-    Label { text: String },
-    Button {
-        #[serde(default)]
-        source_id: Option<String>,
-        label: Option<String>,
-    },
-    Divider,
-    #[serde(other)]
-    Unknown,
-}
-
 pub struct ExtensionGuiView {
     pub(crate) extension_id: Arc<str>,
     focus_handle: FocusHandle,
-    root_element: Option<ViewElement>,
-    wasm_extension: WasmExtension,
-    _message_task: Task<()>,
+    wasm: WasmExtension,
+    ui_tree: Option<wit::since_v0_9_0::ui_elements::UiTree>,
 }
 
 impl ExtensionGuiView {
     pub fn new(
         manifest: Arc<ExtensionManifest>,
-        wasm_extension: WasmExtension,
+        wasm: WasmExtension,
         cx: &mut Context<Self>,
     ) -> Self {
-        let extension_id = manifest.id.clone();
-        let (gui_tx, gui_rx) = mpsc::unbounded::<GuiPanelMessage>();
-        let wasm_extension_for_task = wasm_extension.clone();
-
-        let message_task = cx.spawn(async move |this, cx| {
-            wasm_extension_for_task
-                .inject_gui_panel_tx(gui_tx)
-                .await
-                .log_err();
-
-            // Call gui_init so the extension renders its initial UI
-            wasm_extension_for_task
-                .call_gui_init()
-                .await
-                .log_err();
-
-            let mut rx = gui_rx;
-            while let Some(message) = rx.next().await {
-                if this
-                    .update(cx, |view, cx| view.handle_message(message, cx))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-
-        Self {
-            extension_id,
-            focus_handle: cx.focus_handle(),
-            root_element: None,
-            wasm_extension,
-            _message_task: message_task,
-        }
-    }
-
-    fn handle_message(&mut self, message: GuiPanelMessage, cx: &mut Context<Self>) {
-        match message {
-            GuiPanelMessage::SetView(json) => {
-                match serde_json::from_str::<ViewElement>(&json) {
-                    Ok(element) => {
-                        self.root_element = Some(element);
+        let wasm_for_init = wasm.clone();
+        cx.spawn(async move |this, cx| {
+            wasm_for_init.call_gui_init().await.log_err();
+            match wasm_for_init.call_gui_render().await {
+                Ok(tree) => {
+                    this.update(cx, |view, cx| {
+                        view.ui_tree = Some(tree);
                         cx.notify();
-                    }
-                    Err(error) => {
-                        log::error!("extension_panel: failed to parse view JSON: {error}");
-                    }
+                    })
+                    .log_err();
                 }
+                Err(err) => log::error!("gui_render failed after init: {err}"),
             }
-            GuiPanelMessage::Call { key, method, params: _ } => {
-                let result = match method.as_str() {
-                    "workspace.open_files" => "[]".to_string(),
-                    "editor.get_selection" => "\"\"".to_string(),
-                    _ => "{\"error\":\"unknown method\"}".to_string(),
-                };
-                let wasm_extension = self.wasm_extension.clone();
-                cx.spawn(async move |_, _| {
-                    wasm_extension.call_gui_on_data(key, result).await.log_err();
-                }).detach();
-            }
-            GuiPanelMessage::RequestData(key) => {
-                let wasm_extension = self.wasm_extension.clone();
-                cx.spawn(async move |_, _| {
-                    wasm_extension.call_gui_on_data(key, "null".to_string()).await.log_err();
-                }).detach();
-            }
-            GuiPanelMessage::Emit { .. } => {}
+        })
+        .detach();
+        Self {
+            extension_id: manifest.id.clone(),
+            focus_handle: cx.focus_handle(),
+            wasm,
+            ui_tree: None,
         }
     }
 }
@@ -150,20 +87,40 @@ impl EventEmitter<ItemEvent> for ExtensionGuiView {}
 
 impl Render for ExtensionGuiView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let content: AnyElement = match &self.root_element {
-            Some(root) => render_element(root, cx.weak_entity()),
-            None => gpui::div()
-                .flex()
-                .items_center()
-                .justify_center()
-                .size_full()
-                .child(SharedString::from(format!(
-                    "Loading extension: {}",
-                    self.extension_id
-                )))
-                .into_any_element(),
+        let wasm = self.wasm.clone();
+        let entity = cx.entity().downgrade();
+        let on_event = move |source_id: String,
+                             event: wit::since_v0_9_0::gui::UiEvent,
+                             _window: &mut Window,
+                             cx: &mut App| {
+            let wasm = wasm.clone();
+            let entity = entity.clone();
+            cx.spawn(async move |cx| {
+                wasm.call_gui_on_event(source_id, event).await.log_err();
+                match wasm.call_gui_render().await {
+                    Ok(tree) => {
+                        entity
+                            .update(cx, |view, cx| {
+                                view.ui_tree = Some(tree);
+                                cx.notify();
+                            })
+                            .log_err();
+                    }
+                    Err(err) => log::error!("gui_render failed: {err}"),
+                }
+            })
+            .detach();
         };
-        gpui::div().size_full().child(content)
+        match &self.ui_tree {
+            Some(tree) => {
+                let tree = tree.clone();
+                ui_renderer::render_ui_tree(&tree, on_event, cx).into_any_element()
+            }
+            None => div()
+                .size_full()
+                .child(Label::new("Loading…"))
+                .into_any_element(),
+        }
     }
 }
 
@@ -178,6 +135,7 @@ impl Item for ExtensionGuiView {
 pub struct ExtensionGuiPanel {
     active_pane: gpui::Entity<Pane>,
     width: Option<Pixels>,
+    position: DockPosition,
 }
 
 impl ExtensionGuiPanel {
@@ -202,17 +160,18 @@ impl ExtensionGuiPanel {
         Self {
             active_pane: pane,
             width: None,
+            position: DockPosition::Left,
         }
     }
 
     pub fn add_view(
         &mut self,
         manifest: Arc<ExtensionManifest>,
-        wasm_extension: WasmExtension,
+        wasm: WasmExtension,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let view = cx.new(|cx| ExtensionGuiView::new(manifest, wasm_extension, cx));
+        let view = cx.new(|cx| ExtensionGuiView::new(manifest, wasm, cx));
         self.active_pane.update(cx, |pane, cx| {
             pane.add_item(Box::new(view), true, true, None, window, cx);
         });
@@ -223,7 +182,7 @@ impl ExtensionGuiPanel {
     pub fn open_or_focus(
         &mut self,
         manifest: Arc<ExtensionManifest>,
-        wasm_extension: WasmExtension,
+        wasm: WasmExtension,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -242,7 +201,7 @@ impl ExtensionGuiPanel {
                 pane.activate_item(ix, true, true, window, cx);
             });
         } else {
-            self.add_view(manifest, wasm_extension, window, cx);
+            self.add_view(manifest, wasm, window, cx);
         }
         cx.emit(PanelEvent::Activate);
     }
@@ -309,7 +268,7 @@ impl Panel for ExtensionGuiPanel {
     }
 
     fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
-        DockPosition::Right
+        self.position
     }
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
@@ -318,10 +277,14 @@ impl Panel for ExtensionGuiPanel {
 
     fn set_position(
         &mut self,
-        _position: DockPosition,
+        position: DockPosition,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
+        self.position = position;
+        cx.notify();
+        // Trigger SettingsStore observers so the dock repositions this panel.
+        cx.update_global::<SettingsStore, _>(|_, _| {});
     }
 
     fn size(&self, _window: &Window, _cx: &App) -> Pixels {
@@ -360,7 +323,7 @@ impl Panel for ExtensionGuiPanel {
     }
 
     fn activation_priority(&self) -> u32 {
-        0
+        7
     }
 
     fn toggle_action(&self) -> Box<dyn gpui::Action> {
@@ -374,48 +337,6 @@ impl Render for ExtensionGuiPanel {
     }
 }
 
-fn render_element(element: &ViewElement, entity: WeakEntity<ExtensionGuiView>) -> AnyElement {
-    match element {
-        ViewElement::VFlex { children } => gpui::div()
-            .flex()
-            .flex_col()
-            .children(children.iter().map(|c| render_element(c, entity.clone())))
-            .into_any_element(),
-        ViewElement::HFlex { children } => gpui::div()
-            .flex()
-            .flex_row()
-            .children(children.iter().map(|c| render_element(c, entity.clone())))
-            .into_any_element(),
-        ViewElement::Label { text } => gpui::div()
-            .child(SharedString::from(text.clone()))
-            .into_any_element(),
-        ViewElement::Button { source_id, label } => {
-            let button_source_id = source_id.clone().or(label.clone()).unwrap_or_default();
-            let button_label = label.clone().unwrap_or_default();
-
-            ui::Button::new(
-                SharedString::from(format!("ext-btn-{}", button_source_id)),
-                button_label
-            )
-            .on_click(move |_, _window, cx| {
-                let button_source_id = button_source_id.clone();
-                entity.update(cx, |view, cx| {
-                    let wasm_extension = view.wasm_extension.clone();
-                    cx.spawn(async move |_, _| {
-                        use extension_host::wasm_host::wit::since_v0_9_0::gui::UiEvent;
-                        wasm_extension
-                            .call_gui_on_event(button_source_id, UiEvent::Clicked)
-                            .await
-                            .log_err();
-                    }).detach();
-                }).log_err();
-            })
-            .into_any_element()
-        }
-        ViewElement::Divider => gpui::div().w_full().h(gpui::px(1.0)).into_any_element(),
-        ViewElement::Unknown => gpui::div().into_any_element(),
-    }
-}
 
 /// Registers `ExtensionGuiPanel` actions and subscribes to `ExtensionStore` events so that:
 /// - Commands registered by WASM extensions appear in the command palette.
@@ -436,18 +357,19 @@ pub fn init(cx: &mut App) {
                         .wasm_extension_for_id(&extension_id);
                     if let Some(panel) = workspace.panel::<ExtensionGuiPanel>(cx) {
                         if let Some((manifest, wasm_extension)) = wasm {
+                            let wasm_for_cmd = wasm_extension.clone();
                             cx.spawn_in(window, async move |_, cx| {
                                 panel
                                     .update_in(cx, |panel, window, cx| {
                                         panel.open_or_focus(
                                             manifest,
-                                            wasm_extension.clone(),
+                                            wasm_extension,
                                             window,
                                             cx,
                                         );
                                     })
                                     .ok();
-                                wasm_extension
+                                wasm_for_cmd
                                     .call_run_extension_command(command_id)
                                     .await
                                     .log_err();
@@ -468,11 +390,11 @@ pub fn init(cx: &mut App) {
                     extension_host::Event::GuiExtensionLoaded(manifest, wasm_extension) => {
                         if let Some(panel) = workspace.panel::<ExtensionGuiPanel>(cx) {
                             let manifest = manifest.clone();
-                            let wasm_extension = wasm_extension.clone();
+                            let wasm = wasm_extension.clone();
                             cx.spawn_in(window, async move |_, cx| {
                                 panel
                                     .update_in(cx, |panel, window, cx| {
-                                        panel.add_view(manifest, wasm_extension, window, cx);
+                                        panel.add_view(manifest, wasm, window, cx);
                                     })
                                     .ok();
                             })
@@ -490,11 +412,6 @@ pub fn init(cx: &mut App) {
                                 extension_id: extension_id.clone(),
                                 command_id: command_id.clone(),
                             });
-                        });
-                    }
-                    extension_host::Event::ExtensionUninstalled(extension_id) => {
-                        cx.update_global(|registry: &mut GlobalDynamicCommandRegistry, _| {
-                            registry.0.unregister_extension(extension_id);
                         });
                     }
                     _ => {}

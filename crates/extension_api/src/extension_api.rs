@@ -3,6 +3,7 @@
 pub mod http_client;
 pub mod process;
 pub mod settings;
+pub mod ui;
 
 use core::fmt;
 
@@ -49,7 +50,21 @@ pub use wit::Guest;
 /// Constructs for interacting with the extension GUI panel.
 pub mod gui {
     pub use crate::wit::zed::extension::gui::{
-        Color, Theme, ThemeColors, UiEvent, call, emit, request_data, set_view,
+        Color, Theme, ThemeColors, UiEvent, call, create_focus_handle, drop_focus_handle, emit,
+        request_data, request_focus, set_view, set_view_tree,
+    };
+}
+
+/// WIT-generated UI element types used to describe extension panel layouts.
+/// See also the higher-level builders in `zed_extension_api::ui`.
+pub mod ui_elements {
+    pub use crate::wit::zed::extension::ui_elements::{
+        AbsoluteLength, AlignContent, AlignItems, Background, BoxShadow, Color, CornersAbsolute,
+        CursorStyle, DefiniteLength, DisplayType, DivNode, EdgesAbsolute,
+        EdgesLength, EventFlags, FlexDirection, FlexWrap, FontStyle, FontWeight, Hsla, IconSource,
+        ImgNode, InputNode, JustifyContent, Length, OverflowType, PointF32, PositionType, Style,
+        SvgNode, TextAlign, TextDecoration, TextNode, TextOverflow, UiNode, UiTree,
+        UniformListNode, VisibilityType, WhiteSpace,
     };
 }
 
@@ -300,6 +315,25 @@ pub trait Extension: Send + Sync {
 
     /// Delivers a UI interaction event from an element with the given source ID.
     fn gui_on_event(&mut self, _source_id: String, _event: gui::UiEvent) {}
+
+    /// Returns the full element tree for the extension panel.
+    /// Called by the host after every `gui-on-event`, on first display, and after theme changes.
+    /// Override this to render a UI using [`crate::ui_elements::UiTree`].
+    fn gui_render(&mut self) -> ui_elements::UiTree {
+        ui_elements::UiTree {
+            nodes: vec![],
+            root: 0,
+        }
+    }
+
+    /// Returns the element tree for a single item in a `uniform-list-node`.
+    /// `list_id` matches the `id` field of the `uniform-list-node`.
+    fn gui_render_list_item(&mut self, _list_id: String, _index: u32) -> ui_elements::UiTree {
+        ui_elements::UiTree {
+            nodes: vec![],
+            root: 0,
+        }
+    }
 
     /// Called when the user invokes a command previously registered via [`register_command`].
     fn run_extension_command(&mut self, _command_id: &str) -> Result<(), String> {
@@ -602,6 +636,17 @@ impl wit::Guest for Component {
 
     fn gui_on_event(source_id: String, event: gui::UiEvent) {
         extension().gui_on_event(source_id, event);
+    }
+
+    fn gui_render() -> wit::zed::extension::ui_elements::UiTree {
+        extension().gui_render()
+    }
+
+    fn gui_render_list_item(
+        list_id: String,
+        index: u32,
+    ) -> wit::zed::extension::ui_elements::UiTree {
+        extension().gui_render_list_item(list_id, index)
     }
 
     fn run_extension_command(command_id: String) -> Result<(), String> {

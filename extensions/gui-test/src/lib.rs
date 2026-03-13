@@ -1,112 +1,17 @@
-use zed_extension_api::{Extension, gui, register_command, serde_json};
+use zed_extension_api::{Extension, register_command};
 
-struct GuiTest {
-    result_text: String,
-}
-
-impl GuiTest {
-    fn render(&self) {
-        let result = serde_json::to_string(&self.result_text).unwrap_or_default();
-        let view = format!(
-            r#"{{
-                "type": "vflex",
-                "children": [
-                    {{ "type": "label", "text": "GUI Test Extension" }},
-                    {{ "type": "divider" }},
-                    {{
-                        "type": "hflex",
-                        "children": [
-                            {{ "type": "button", "source-id": "btn-open-files", "label": "Get Open Files" }},
-                            {{ "type": "button", "source-id": "btn-selection", "label": "Get Selection" }}
-                        ]
-                    }},
-                    {{ "type": "divider" }},
-                    {{ "type": "label", "text": {result} }}
-                ]
-            }}"#
-        );
-        gui::set_view(&view);
-    }
-}
+struct GuiTest;
 
 impl Extension for GuiTest {
     fn new() -> Self {
         register_command("open-panel", "open panel");
-        register_command("clear-result", "clear result");
-        register_command("get-open-files", "get open files");
-        register_command("get-selection", "get selection");
-        register_command("test-request-data", "test request data");
-        register_command("test-emit", "test emit");
-        register_command("test-error", "test error");
-        GuiTest {
-            result_text: "Click a button to call a host action.".to_string(),
-        }
-    }
-
-    fn gui_init(&mut self) {
-        self.render();
-    }
-
-    fn gui_on_theme_change(&mut self, _theme: gui::Theme) {}
-
-    fn gui_on_data(&mut self, key: String, value: String) {
-        self.result_text = format!("[{key}] {value}");
-        self.render();
+        GuiTest
     }
 
     fn run_extension_command(&mut self, command_id: &str) -> Result<(), String> {
         match command_id {
             "open-panel" => Ok(()),
-            "clear-result" => {
-                self.result_text = String::new();
-                self.render();
-                Ok(())
-            }
-            "get-open-files" => {
-                if let Err(err) = gui::call("get-open-files", "workspace.open_files", "{}") {
-                    self.result_text = format!("error: {err}");
-                    self.render();
-                }
-                Ok(())
-            }
-            "get-selection" => {
-                if let Err(err) = gui::call("get-selection", "editor.get_selection", "{}") {
-                    self.result_text = format!("error: {err}");
-                    self.render();
-                }
-                Ok(())
-            }
-            // Tests gui::request_data — host returns "null", delivered via gui_on_data callback.
-            "test-request-data" => {
-                self.result_text = "waiting for request-data response…".to_string();
-                self.render();
-                gui::request_data("req-test");
-                Ok(())
-            }
-            // Tests gui::emit — currently a no-op on the host, but verifies the call compiles and runs.
-            "test-emit" => {
-                gui::emit("test-event", r#"{"source":"command-palette"}"#);
-                self.result_text = "emit sent (check host logs)".to_string();
-                self.render();
-                Ok(())
-            }
-            // Returns an error to exercise the error propagation path in run-extension-command.
-            "test-error" => Err("intentional test error from run-extension-command".to_string()),
             _ => Err(format!("unknown command: {command_id}")),
-        }
-    }
-
-    fn gui_on_event(&mut self, source_id: String, event: gui::UiEvent) {
-        if matches!(event, gui::UiEvent::Clicked) {
-            let method = match source_id.as_str() {
-                "btn-open-files" => "workspace.open_files",
-                "btn-selection" => "editor.get_selection",
-                _ => return,
-            };
-            if let Err(err) = gui::call(&source_id, method, "{}") {
-                self.result_text = format!("error: {err}");
-                self.render();
-            }
         }
     }
 }

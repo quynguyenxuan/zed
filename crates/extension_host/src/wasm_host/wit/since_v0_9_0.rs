@@ -242,11 +242,38 @@ impl PanelUiImports for WasmState {
     }
 }
 
+impl ui_elements::Host for WasmState {}
+
 impl gui::Host for WasmState {
     async fn set_view(&mut self, view_json: String) -> wasmtime::Result<()> {
         if let Some(tx) = &self.gui_panel_tx {
             let _ = tx.unbounded_send(crate::wasm_host::GuiPanelMessage::SetView(view_json));
         }
+        Ok(())
+    }
+
+    async fn set_view_tree(&mut self, tree: ui_elements::UiTree) -> wasmtime::Result<()> {
+        if let Some(tx) = &self.gui_panel_tx {
+            let _ = tx.unbounded_send(crate::wasm_host::GuiPanelMessage::SetViewTree(tree));
+        }
+        Ok(())
+    }
+
+    async fn create_focus_handle(&mut self) -> wasmtime::Result<u32> {
+        let id = self.next_focus_handle_id;
+        self.next_focus_handle_id = self.next_focus_handle_id.saturating_add(1);
+        Ok(id)
+    }
+
+    async fn request_focus(&mut self, handle_id: u32) -> wasmtime::Result<()> {
+        if let Some(tx) = &self.gui_panel_tx {
+            let _ =
+                tx.unbounded_send(crate::wasm_host::GuiPanelMessage::RequestFocus(handle_id));
+        }
+        Ok(())
+    }
+
+    async fn drop_focus_handle(&mut self, _handle_id: u32) -> wasmtime::Result<()> {
         Ok(())
     }
 

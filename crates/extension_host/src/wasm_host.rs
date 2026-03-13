@@ -70,12 +70,6 @@ pub struct WasmExtension {
     _task: Arc<Task<Result<(), gpui_tokio::JoinError>>>,
 }
 
-impl Drop for WasmExtension {
-    fn drop(&mut self) {
-        self.tx.close_channel();
-    }
-}
-
 #[async_trait]
 impl extension::Extension for WasmExtension {
     fn manifest(&self) -> Arc<ExtensionManifest> {
@@ -537,10 +531,13 @@ pub struct WasmState {
     pub host: Arc<WasmHost>,
     pub(crate) capability_granter: CapabilityGranter,
     pub(crate) gui_panel_tx: Option<mpsc::UnboundedSender<GuiPanelMessage>>,
+    pub(crate) next_focus_handle_id: u32,
 }
 
 pub enum GuiPanelMessage {
     SetView(String),
+    SetViewTree(wit::since_v0_9_0::ui_elements::UiTree),
+    RequestFocus(u32),
     Emit { name: String, data: String },
     RequestData(String),
     Call { key: String, method: String, params: String },
@@ -686,6 +683,7 @@ impl WasmHost {
                         manifest.clone(),
                     ),
                     gui_panel_tx: None,
+                    next_focus_handle_id: 0,
                 },
             );
             // Store will yield after 1 tick, and get a new deadline of 1 tick after each yield.
@@ -962,6 +960,24 @@ impl WasmExtension {
     ) -> Result<()> {
         self.call(move |ext, store| {
             async move { ext.call_gui_on_event(store, &source_id, event).await }.boxed()
+        })
+        .await?
+    }
+
+    pub async fn call_gui_render(&self) -> Result<wit::since_v0_9_0::ui_elements::UiTree> {
+        self.call(|ext, store| {
+            async move { ext.call_gui_render(store).await }.boxed()
+        })
+        .await?
+    }
+
+    pub async fn call_gui_render_list_item(
+        &self,
+        list_id: String,
+        index: u32,
+    ) -> Result<wit::since_v0_9_0::ui_elements::UiTree> {
+        self.call(move |ext, store| {
+            async move { ext.call_gui_render_list_item(store, &list_id, index).await }.boxed()
         })
         .await?
     }

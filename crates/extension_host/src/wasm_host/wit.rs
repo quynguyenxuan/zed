@@ -1472,6 +1472,36 @@ impl Extension {
         }
     }
 
+    pub async fn call_gui_render(
+        &self,
+        store: &mut Store<WasmState>,
+    ) -> Result<since_v0_9_0::ui_elements::UiTree> {
+        match self {
+            Extension::V0_9_0(ext) => ext.call_gui_render(store).await,
+            _ => Ok(since_v0_9_0::ui_elements::UiTree {
+                nodes: vec![],
+                root: 0,
+            }),
+        }
+    }
+
+    pub async fn call_gui_render_list_item(
+        &self,
+        store: &mut Store<WasmState>,
+        list_id: &str,
+        index: u32,
+    ) -> Result<since_v0_9_0::ui_elements::UiTree> {
+        match self {
+            Extension::V0_9_0(ext) => {
+                ext.call_gui_render_list_item(store, list_id, index).await
+            }
+            _ => Ok(since_v0_9_0::ui_elements::UiTree {
+                nodes: vec![],
+                root: 0,
+            }),
+        }
+    }
+
     pub async fn call_run_extension_command(
         &self,
         store: &mut Store<WasmState>,

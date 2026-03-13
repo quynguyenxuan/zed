@@ -7,7 +7,11 @@ world panel-ui {
     /// GUI host functions provided by Zed.
     import gui;
 
+    /// UI element type definitions.
+    import ui-elements;
+
     use gui.{theme, ui-event};
+    use ui-elements.{ui-tree};
 
     /// Called once when the GUI panel is first shown.
     export gui-init: func();
@@ -21,4 +25,13 @@ world panel-ui {
 
     /// Delivers a UI interaction event from an element with the given source-id.
     export gui-on-event: func(source-id: string, event: ui-event);
+
+    /// Host calls this after every gui-on-event to get the updated element tree.
+    /// Also called on first display and after theme changes.
+    /// Extension returns its full current element tree.
+    export gui-render: func() -> ui-tree;
+
+    /// Host calls this to render a single item in a uniform-list.
+    /// list-id matches the id field of the uniform-list-node.
+    export gui-render-list-item: func(list-id: string, index: u32) -> ui-tree;
 }

@@ -4,79 +4,28 @@
 
 **Goal:** Register `ExtensionGuiPanel` at startup (always-visible footer button); add `register-command` / `run-extension-command` to `extension.wit` so any extension can register commands in `ctrl+shift+P` and handle invocations; wire `gui-test` to open its panel tab.
 
-**Architecture:** `register-command` is an import in `extension.wit` (all extension types). When called, `WasmState::on_main_thread` writes to `GlobalDynamicCommandRegistry` (App global in `command_palette_hooks`). `command_palette.rs` reads the registry. On invocation, `zed.rs` dispatches `OpenExtensionPanel` action then calls `WasmExtension::call_run_extension_command`. `extension_host` does NOT depend on `extension_panel` — `zed.rs` is the integration point.
+**Architecture:** `register-command` is a WIT import in `extension.wit` (all extension types). When called, `WasmState::register_command` sends to a channel owned by `ExtensionStore`. `ExtensionStore` reads the channel and emits `Event::ExtensionCommandRegistered`. `extension_panel::init(cx)` subscribes to `ExtensionStore` events, updates `GlobalDynamicCommandRegistry` (in `command_palette_hooks`), and handles the `OpenExtensionPanel` action. `command_palette.rs` reads the registry to show commands. `extension_host` does NOT depend on `extension_panel` — `extension_panel::init(cx)` is the integration point, following the same pattern as `notification_panel::init(cx)`.
 
-**Tech Stack:** Rust, GPUI, wasmtime WIT component model, `mpsc::UnboundedSender<MainThreadCall>` for main-thread dispatch.
+**Tech Stack:** Rust, GPUI, wasmtime WIT component model, `mpsc::UnboundedSender` for channel-based dispatch from WASM threads to GPUI main thread.
 
 ---
 
 ## Status check before starting
 
-Task 1 (footer button) is **already done** — verify:
+Verify existing work is in place:
 ```bash
-grep "extension_panel\|ExtensionGuiPanel::load" crates/zed/src/zed.rs | grep -v "^Binary"
+grep -n "ExtensionGuiPanel::load\|extension_panel" crates/zed/src/zed.rs | grep -v "^Binary"
 ```
-Expected: `ExtensionGuiPanel::load(...)` present in the `futures::join!` block.
+Expected: `ExtensionGuiPanel::load(...)` present at line ~666, listed in the `futures::join!` block at line ~691.
 
 ---
 
-## Task 1: Simplify `GuiExtensionLoaded` handler in `zed.rs`
-
-The panel is always registered at startup now — the fallback `else` branch that creates a new panel is dead code.
-
-**Files:**
-- Modify: `crates/zed/src/zed.rs:428-453`
-
-**Step 1: Replace handler**
-
-Find the block:
-```rust
-let panel = if let Some(panel) = workspace.panel::<ExtensionGuiPanel>(cx) {
-    panel
-} else {
-    ...
-    workspace.add_panel(panel.clone(), window, cx);
-    panel
-};
-```
-
-Replace the entire `GuiExtensionLoaded` branch with:
-```rust
-if let extension_host::Event::GuiExtensionLoaded(manifest, wasm_extension) = event {
-    if let Some(panel) = workspace.panel::<ExtensionGuiPanel>(cx) {
-        let manifest = manifest.clone();
-        let wasm_extension = wasm_extension.clone();
-        cx.spawn_in(window, async move |_, cx| {
-            panel
-                .update_in(cx, |panel, window, cx| {
-                    panel.add_view(manifest, wasm_extension, window, cx);
-                })
-                .ok();
-        })
-        .detach();
-    }
-}
-```
-
-**Step 2: Check**
-```bash
-cargo check -p zed 2>&1 | grep "^error"
-```
-
-**Step 3: Commit**
-```bash
-git add crates/zed/src/zed.rs
-git commit -m "extension_panel: simplify GuiExtensionLoaded handler"
-```
-
----
-
-## Task 2: Add `register-command` to `extension.wit`
+## Task 1: Add `register-command` import and `run-extension-command` export to `extension.wit`
 
 **Files:**
 - Modify: `crates/extension_api/wit/since_v0.9.0/extension.wit`
 
-**Step 1: Add import after `import get-settings`**
+**Step 1: Add import after `import get-settings` (line 51)**
 
 ```wit
 /// Registers a command that appears in Zed's command palette.
@@ -84,7 +33,7 @@ git commit -m "extension_panel: simplify GuiExtensionLoaded handler"
 import register-command: func(id: string, label: string);
 ```
 
-**Step 2: Add export near other exports (after `export run-slash-command`)**
+**Step 2: Add export after `export run-slash-command` (line 154)**
 
 ```wit
 /// Called when the user invokes a command previously registered via `register-command`.
@@ -104,107 +53,100 @@ git commit -m "extension_api: add register-command import and run-extension-comm
 
 ---
 
-## Task 3: Implement `register-command` host function in `wasm_host/wit.rs`
+## Task 2: Add channel + `Event::ExtensionCommandRegistered` to `extension_host`
 
 **Files:**
-- Modify: `crates/extension_host/src/wasm_host/wit.rs`
+- Modify: `crates/extension_host/src/wasm_host.rs`
+- Modify: `crates/extension_host/src/extension_host.rs`
 
-**Step 1: Find where GUI host functions are implemented**
+**Step 1: Add field to `WasmHost` struct in `wasm_host.rs`**
 
-Search for the existing `set_view` implementation:
-```bash
-grep -n "fn set_view\|fn register_command\|fn emit\b" crates/extension_host/src/wasm_host/wit.rs | head -10
+In `pub struct WasmHost { ... }`, add after `main_thread_message_tx`:
+```rust
+pub(crate) command_registrations_tx: mpsc::UnboundedSender<(Arc<str>, String, Arc<str>)>,
 ```
 
-**Step 2: Add `register_command` implementation**
+**Step 2: Add `command_registrations_tx` parameter to `WasmHost::new`**
 
-In the same impl block where `set_view`, `emit`, `call` are implemented (V0_9_0 host functions), add:
+Change the function signature:
+```rust
+pub fn new(
+    fs: Arc<dyn Fs>,
+    http_client: Arc<dyn HttpClient>,
+    node_runtime: NodeRuntime,
+    proxy: Arc<ExtensionHostProxy>,
+    work_dir: PathBuf,
+    command_registrations_tx: mpsc::UnboundedSender<(Arc<str>, String, Arc<str>)>,
+    cx: &mut App,
+) -> Arc<Self> {
+```
+
+Add the field in the `Arc::new(Self { ... })` initializer:
+```rust
+command_registrations_tx,
+```
+
+**Step 3: Add `Event::ExtensionCommandRegistered` variant to `Event` enum in `extension_host.rs`**
 
 ```rust
-fn register_command(
-    &mut self,
-    _store: wasmtime::StoreContextMut<WasmState>,
-    id: String,
-    label: String,
-) -> wasmtime::Result<()> {
-    let extension_id = _store.data().manifest.id.clone();
-    let extension_name = _store.data().manifest.name.clone();
-    _store
-        .data()
-        .on_main_thread(move |cx| {
-            async move {
-                cx.update_global(|registry: &mut GlobalDynamicCommandRegistry, _| {
-                    registry.0.register(DynamicCommand {
-                        name: format!(
-                            "{}: {}",
-                            extension_name.to_lowercase().replace(' ', "_"),
-                            label
-                        ),
-                        extension_id: extension_id.clone(),
-                        action: Box::new(OpenExtensionPanel {
-                            extension_id,
-                            command_id: id.into(),
-                        }),
-                    });
-                });
-            }
-            .boxed_local()
+ExtensionCommandRegistered {
+    extension_id: Arc<str>,
+    display_name: String,
+    command_id: Arc<str>,
+},
+```
+
+**Step 4: Update `ExtensionStore::new` in `extension_host.rs`**
+
+Before the `let mut this = Self { ... }` block (~line 253), add:
+```rust
+let (command_tx, mut command_rx) = mpsc::unbounded::<(Arc<str>, String, Arc<str>)>();
+```
+
+Pass `command_tx` to `WasmHost::new`:
+```rust
+wasm_host: WasmHost::new(
+    fs.clone(),
+    http_client.clone(),
+    node_runtime,
+    extension_host_proxy,
+    work_dir,
+    command_tx,
+    cx,
+),
+```
+
+After constructing `this`, add a task that reads from the channel and emits events. Push it to `this.tasks`:
+```rust
+let command_task = cx.spawn(async move |this, mut cx| {
+    while let Some((extension_id, display_name, command_id)) = command_rx.next().await {
+        this.update(&mut cx, |_, cx| {
+            cx.emit(Event::ExtensionCommandRegistered {
+                extension_id,
+                display_name,
+                command_id,
+            });
         })
-        .await;
-    Ok(())
-}
-```
-
-Note: this requires importing `GlobalDynamicCommandRegistry`, `DynamicCommand` from `command_palette_hooks`, and `OpenExtensionPanel` from `extension_panel`. Check that these are accessible (no circular dependency: `extension_host` does not depend on `extension_panel` today).
-
-**If circular dependency**: move `OpenExtensionPanel` to a shared crate, OR store only `(extension_id, command_id)` as strings and let `zed.rs` create the action later (see Task 7 alternative).
-
-**Preferred approach (avoids circular dep)**: Store only strings in the registry, wrap creation in `zed.rs`.
-
-Use this simpler version that stores a plain `InvokeExtensionCommand` action (defined in `command_palette_hooks` with just string fields):
-
-```rust
-// In on_main_thread closure:
-cx.update_global(|registry: &mut GlobalDynamicCommandRegistry, _| {
-    registry.0.register(DynamicCommand {
-        name: format!("{}: {}", display_name, label),
-        extension_id: extension_id.clone(),
-        command_id: id.clone().into(),
-    });
+        .ok();
+    }
 });
+this.tasks.push(command_task);
 ```
 
-Where `DynamicCommand` stores `command_id: Arc<str>` directly (see Task 4 for updated struct).
-
-**Step 3: Add `run_extension_command` stub to Extension trait**
-
-In `wasm_host/wit.rs`, find where `call_gui_init` etc. are wrapped. Add:
-
-```rust
-pub async fn call_run_extension_command(&self, command_id: String) -> Result<()> {
-    self.call(move |ext, store| {
-        async move { ext.call_run_extension_command(store, &command_id).await }.boxed()
-    })
-    .await?
-}
-```
-
-**Step 4: Check**
+**Step 5: Check**
 ```bash
 cargo check -p extension_host 2>&1 | grep "^error"
 ```
 
-**Step 5: Commit**
+**Step 6: Commit**
 ```bash
-git add crates/extension_host/src/wasm_host/wit.rs crates/extension_host/src/wasm_host.rs
-git commit -m "extension_host: implement register-command and run-extension-command"
+git add crates/extension_host/src/wasm_host.rs crates/extension_host/src/extension_host.rs
+git commit -m "extension_host: add command registration channel and ExtensionCommandRegistered event"
 ```
 
 ---
 
-## Task 4: Update `DynamicCommandRegistry` (no `Box<dyn Action>`, store strings)
-
-This avoids circular dependency between `extension_host` and `extension_panel`.
+## Task 3: Add `DynamicCommandRegistry` to `command_palette_hooks`
 
 **Files:**
 - Modify: `crates/command_palette_hooks/src/command_palette_hooks.rs`
@@ -246,12 +188,13 @@ impl DynamicCommandRegistry {
 
 #[derive(Default)]
 pub struct GlobalDynamicCommandRegistry(pub DynamicCommandRegistry);
+
 impl Global for GlobalDynamicCommandRegistry {}
 ```
 
-**Step 2: Initialize in `init`**
+**Step 2: Initialize in `pub fn init(cx: &mut App)`**
 
-In `pub fn init(cx: &mut App)`, add:
+Add to the `init` function:
 ```rust
 cx.set_global(GlobalDynamicCommandRegistry::default());
 ```
@@ -269,16 +212,14 @@ git commit -m "command_palette_hooks: add DynamicCommandRegistry"
 
 ---
 
-## Task 5: Add `OpenExtensionPanel` action and `open_or_focus` to `extension_panel`
+## Task 4: Add `OpenExtensionPanel` action and `open_or_focus` to `extension_panel`
 
 **Files:**
 - Modify: `crates/extension_panel/src/extension_panel.rs`
 
-**Step 1: Add import**
+**Step 1: Add `use serde::Serialize;` to existing `use serde::Deserialize;` import**
 
-Add `use serde::Serialize;` alongside existing `use serde::Deserialize;`.
-
-**Step 2: Add action after `actions!` block (~line 29)**
+**Step 2: Add `OpenExtensionPanel` action after the `actions!` block (~line 29)**
 
 ```rust
 /// Opens a specific extension in the extension GUI panel by extension and command ID.
@@ -289,9 +230,9 @@ pub struct OpenExtensionPanel {
 }
 ```
 
-**Step 3: Make `extension_id` accessible inside crate**
+**Step 3: Make `extension_id` in `ExtensionGuiView` pub(crate)**
 
-In `pub struct ExtensionGuiView`, change `extension_id: Arc<str>` to `pub(crate) extension_id: Arc<str>`.
+Change `extension_id: Arc<str>` to `pub(crate) extension_id: Arc<str>` in `pub struct ExtensionGuiView`.
 
 **Step 4: Add `open_or_focus` to `ExtensionGuiPanel` impl block**
 
@@ -311,7 +252,7 @@ pub fn open_or_focus(
         .items()
         .enumerate()
         .find_map(|(ix, item)| {
-            item.to_any_view()
+            item.to_any()
                 .downcast::<ExtensionGuiView>()
                 .ok()
                 .filter(|v| v.read(cx).extension_id == manifest.id)
@@ -330,6 +271,8 @@ pub fn open_or_focus(
 }
 ```
 
+Note: if `item.to_any()` is not the correct method name for downcasting items from a `Pane`, check the `ItemHandle` trait in `workspace/src/item.rs` for the actual method (may be `to_any_handle()`, `as_any()`, or similar). The pattern is: get an `Entity<ExtensionGuiView>` from the item handle.
+
 **Step 5: Check**
 ```bash
 cargo check -p extension_panel 2>&1 | grep "^error"
@@ -343,75 +286,231 @@ git commit -m "extension_panel: add OpenExtensionPanel action and open_or_focus"
 
 ---
 
-## Task 6: Make `command_palette` read `GlobalDynamicCommandRegistry`
+## Task 5: Add `extension_panel::init(cx)` with all workspace wiring
 
 **Files:**
-- Modify: `crates/command_palette/src/command_palette.rs:11-14`
+- Modify: `crates/extension_panel/src/extension_panel.rs`
+- Modify: `crates/extension_panel/Cargo.toml`
 
-**Step 1: Add import**
-
-In the `use command_palette_hooks::{...}` block, add `GlobalDynamicCommandRegistry`:
-```rust
-use command_palette_hooks::{
-    CommandInterceptItem, CommandInterceptResult, CommandPaletteFilter,
-    GlobalCommandPaletteInterceptor, GlobalDynamicCommandRegistry,
-};
-```
-
-**Step 2: Append dynamic commands after `let commands`**
-
-After `let commands: Vec<_> = window.available_actions(cx)...collect();`:
-```rust
-let commands = {
-    let mut commands = commands;
-    if let Some(registry) = cx.try_global::<GlobalDynamicCommandRegistry>() {
-        // Extension commands: create OpenExtensionPanel action per entry.
-        // The action is constructed here to avoid circular deps in extension_host.
-        commands.extend(registry.0.commands().map(|cmd| {
-            use extension_panel::OpenExtensionPanel;
-            Command {
-                name: cmd.name.clone(),
-                action: Box::new(OpenExtensionPanel {
-                    extension_id: cmd.extension_id.clone(),
-                    command_id: cmd.command_id.clone(),
-                }),
-            }
-        }));
-    }
-    commands
-};
-```
-
-Note: `command_palette` must add `extension_panel` as a dependency in `Cargo.toml`.
-
-**Step 3: Add `extension_panel` to `command_palette/Cargo.toml`**
+**Step 1: Add `command_palette_hooks` to `Cargo.toml`**
 
 ```toml
-[dependencies]
-...
-extension_panel.workspace = true
+command_palette_hooks.workspace = true
 ```
 
-**Step 4: Check**
+**Step 2: Verify `ExtensionStore` is publicly accessible**
 ```bash
-cargo check -p command_palette 2>&1 | grep "^error"
+grep "pub struct ExtensionStore\|pub use.*ExtensionStore" crates/extension_host/src/extension_host.rs | head -5
 ```
 
-**Step 5: Commit**
+**Step 3: Add imports to `extension_panel.rs`**
+
+At the top, add:
+```rust
+use command_palette_hooks::{DynamicCommand, GlobalDynamicCommandRegistry};
+use extension_host::ExtensionStore;
+```
+
+**Step 4: Add `pub fn init(cx: &mut App)` function**
+
+```rust
+pub fn init(cx: &mut App) {
+    cx.observe_new(
+        |workspace: &mut Workspace,
+         window: Option<&mut Window>,
+         cx: &mut Context<Workspace>| {
+            let Some(window) = window else { return };
+
+            workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
+                workspace.toggle_panel_focus::<ExtensionGuiPanel>(window, cx);
+            });
+
+            workspace.register_action(|workspace, action: &OpenExtensionPanel, window, cx| {
+                let extension_id = action.extension_id.clone();
+                let command_id = action.command_id.clone();
+                let extension_store = ExtensionStore::global(cx);
+                let wasm = extension_store.read(cx).wasm_extension_for_id(&extension_id);
+                if let Some(panel) = workspace.panel::<ExtensionGuiPanel>(cx) {
+                    if let Some((manifest, wasm_extension)) = wasm {
+                        cx.spawn_in(window, async move |_, cx| {
+                            panel
+                                .update_in(cx, |panel, window, cx| {
+                                    panel.open_or_focus(manifest, wasm_extension.clone(), window, cx);
+                                })
+                                .ok();
+                            wasm_extension
+                                .call_run_extension_command(command_id.to_string())
+                                .await
+                                .log_err();
+                        })
+                        .detach();
+                    } else {
+                        workspace.toggle_panel_focus::<ExtensionGuiPanel>(window, cx);
+                    }
+                }
+            });
+
+            let extension_store = ExtensionStore::global(cx);
+            cx.subscribe_in(
+                &extension_store,
+                window,
+                |workspace, _, event, window, cx| match event {
+                    extension_host::Event::GuiExtensionLoaded(manifest, wasm_extension) => {
+                        if let Some(panel) = workspace.panel::<ExtensionGuiPanel>(cx) {
+                            let manifest = manifest.clone();
+                            let wasm_extension = wasm_extension.clone();
+                            cx.spawn_in(window, async move |_, cx| {
+                                panel
+                                    .update_in(cx, |panel, window, cx| {
+                                        panel.add_view(manifest, wasm_extension, window, cx);
+                                    })
+                                    .ok();
+                            })
+                            .detach();
+                        }
+                    }
+                    extension_host::Event::ExtensionCommandRegistered {
+                        extension_id,
+                        display_name,
+                        command_id,
+                    } => {
+                        cx.update_global(|registry: &mut GlobalDynamicCommandRegistry, _| {
+                            registry.0.register(DynamicCommand {
+                                name: display_name.clone(),
+                                extension_id: extension_id.clone(),
+                                command_id: command_id.clone(),
+                            });
+                        });
+                    }
+                    extension_host::Event::ExtensionUninstalled(extension_id) => {
+                        cx.update_global(|registry: &mut GlobalDynamicCommandRegistry, _| {
+                            registry.0.unregister_extension(extension_id);
+                        });
+                    }
+                    _ => {}
+                },
+            )
+            .detach();
+        },
+    )
+    .detach();
+}
+```
+
+**Step 5: Check**
 ```bash
-git add crates/command_palette/src/command_palette.rs crates/command_palette/Cargo.toml
-git commit -m "command_palette: include extension commands from GlobalDynamicCommandRegistry"
+cargo check -p extension_panel 2>&1 | grep "^error"
+```
+
+**Step 6: Commit**
+```bash
+git add crates/extension_panel/src/extension_panel.rs crates/extension_panel/Cargo.toml
+git commit -m "extension_panel: add init(cx) with workspace wiring"
 ```
 
 ---
 
-## Task 7: Add `wasm_extension_for_id` to `ExtensionStore`
+## Task 6: Implement `register_command` host function in `since_v0_9_0.rs`
 
 **Files:**
-- Modify: `crates/extension_host/src/extension_host.rs` (after line 441)
+- Modify: `crates/extension_host/src/wasm_host/wit/since_v0_9_0.rs`
 
-**Step 1: Add method**
+**Step 1: Add `register_command` to `impl PanelUiImports for WasmState`**
 
+After `make_file_executable` (~line 228), add:
+```rust
+async fn register_command(
+    &mut self,
+    id: String,
+    label: String,
+) -> wasmtime::Result<()> {
+    let extension_id = self.manifest.id.clone();
+    let display_name = format!(
+        "{}: {}",
+        self.manifest.name.to_lowercase().replace(' ', "_"),
+        label
+    );
+    self.host
+        .command_registrations_tx
+        .unbounded_send((extension_id, display_name, id.into()))
+        .ok();
+    Ok(())
+}
+```
+
+**Step 2: Check**
+```bash
+cargo check -p extension_host 2>&1 | grep "^error"
+```
+
+**Step 3: Commit**
+```bash
+git add crates/extension_host/src/wasm_host/wit/since_v0_9_0.rs
+git commit -m "extension_host: implement register_command host function"
+```
+
+---
+
+## Task 7: Add `call_run_extension_command` to `Extension` and `WasmExtension`
+
+**Files:**
+- Modify: `crates/extension_host/src/wasm_host/wit.rs`
+- Modify: `crates/extension_host/src/wasm_host.rs`
+
+**Step 1: Add `call_run_extension_command` to `impl Extension` in `wit.rs`**
+
+After `call_gui_on_event` (~line 1473):
+```rust
+pub async fn call_run_extension_command(
+    &self,
+    store: &mut Store<WasmState>,
+    command_id: &str,
+) -> Result<Result<(), String>> {
+    match self {
+        Extension::V0_9_0(ext) => ext.call_run_extension_command(store, command_id).await,
+        _ => Ok(Ok(())),
+    }
+}
+```
+
+**Step 2: Add `call_run_extension_command` to `WasmExtension` in `wasm_host.rs`**
+
+After `call_gui_on_event`:
+```rust
+pub async fn call_run_extension_command(&self, command_id: String) -> Result<()> {
+    self.call(move |ext, store| {
+        async move {
+            ext.call_run_extension_command(store, &command_id)
+                .await?
+                .map_err(|e| anyhow::anyhow!(e))
+        }
+        .boxed()
+    })
+    .await
+}
+```
+
+**Step 3: Check**
+```bash
+cargo check -p extension_host 2>&1 | grep "^error"
+```
+
+**Step 4: Commit**
+```bash
+git add crates/extension_host/src/wasm_host/wit.rs crates/extension_host/src/wasm_host.rs
+git commit -m "extension_host: add call_run_extension_command to Extension and WasmExtension"
+```
+
+---
+
+## Task 8: Add `wasm_extension_for_id` to `ExtensionStore`
+
+**Files:**
+- Modify: `crates/extension_host/src/extension_host.rs`
+
+**Step 1: Add method to `impl ExtensionStore`**
+
+Find the `impl ExtensionStore` block (search for `fn reload` or `fn install_extension`) and add:
 ```rust
 /// Returns the loaded WASM extension and manifest for the given extension ID.
 pub fn wasm_extension_for_id(
@@ -438,71 +537,100 @@ git commit -m "extension_host: add wasm_extension_for_id lookup"
 
 ---
 
-## Task 8: Wire everything in `zed.rs`
+## Task 9: Make `command_palette` read `GlobalDynamicCommandRegistry`
+
+**Files:**
+- Modify: `crates/command_palette/src/command_palette.rs`
+- Modify: `crates/command_palette/Cargo.toml`
+
+**Step 1: Add `extension_panel` to `command_palette/Cargo.toml`**
+
+```toml
+extension_panel.workspace = true
+```
+
+**Step 2: Add `GlobalDynamicCommandRegistry` to imports in `command_palette.rs`**
+
+Change:
+```rust
+use command_palette_hooks::{
+    CommandInterceptItem, CommandInterceptResult, CommandPaletteFilter,
+    GlobalCommandPaletteInterceptor,
+};
+```
+To:
+```rust
+use command_palette_hooks::{
+    CommandInterceptItem, CommandInterceptResult, CommandPaletteFilter,
+    GlobalCommandPaletteInterceptor, GlobalDynamicCommandRegistry,
+};
+```
+
+**Step 3: Extend the commands list in `CommandPalette::new`**
+
+Replace `let commands = window.available_actions(cx)...collect();` with:
+```rust
+let mut commands: Vec<Command> = window
+    .available_actions(cx)
+    .into_iter()
+    .filter_map(|action| {
+        if filter.is_some_and(|filter| filter.is_hidden(&*action)) {
+            return None;
+        }
+        Some(Command {
+            name: humanize_action_name(action.name()),
+            action,
+        })
+    })
+    .collect();
+
+if let Some(registry) = cx.try_global::<GlobalDynamicCommandRegistry>() {
+    commands.extend(registry.0.commands().map(|cmd| Command {
+        name: cmd.name.clone(),
+        action: Box::new(extension_panel::OpenExtensionPanel {
+            extension_id: cmd.extension_id.clone(),
+            command_id: cmd.command_id.clone(),
+        }),
+    }));
+}
+let commands = commands;
+```
+
+**Step 4: Check**
+```bash
+cargo check -p command_palette 2>&1 | grep "^error"
+```
+
+**Step 5: Commit**
+```bash
+git add crates/command_palette/src/command_palette.rs crates/command_palette/Cargo.toml
+git commit -m "command_palette: include extension commands from GlobalDynamicCommandRegistry"
+```
+
+---
+
+## Task 10: Wire `extension_panel::init(cx)` in `zed.rs`; remove old handler
 
 **Files:**
 - Modify: `crates/zed/src/zed.rs`
 
-**Step 1: Add imports**
-
-```rust
-use extension_panel::OpenExtensionPanel;
-use command_palette_hooks::GlobalDynamicCommandRegistry;
+**Step 1: Find existing wiring to remove**
+```bash
+grep -n "GuiExtensionLoaded\|extension_panel::ToggleFocus\|ExtensionGuiPanel\|extension_panel" crates/zed/src/zed.rs | head -20
 ```
 
-**Step 2: Register `OpenExtensionPanel` workspace handler**
+**Step 2: Add `extension_panel::init(cx)` call**
 
-In the `cx.observe_new` block near the `extension_panel::ToggleFocus` handler (~line 1079), add:
-
+Find where other panel init functions are called (e.g., near `collab_ui::init(cx)` or `command_palette::init(cx)`). Add:
 ```rust
-.register_action(
-    |workspace: &mut Workspace,
-     action: &OpenExtensionPanel,
-     window: &mut Window,
-     cx: &mut Context<Workspace>| {
-        let extension_id = action.extension_id.clone();
-        let command_id = action.command_id.clone();
-        let extension_store = ExtensionStore::global(cx);
-        let wasm = extension_store
-            .read(cx)
-            .wasm_extension_for_id(&extension_id);
-
-        if let Some(panel) = workspace.panel::<ExtensionGuiPanel>(cx) {
-            if let Some((manifest, wasm_extension)) = wasm.clone() {
-                // Open/focus the panel tab
-                cx.spawn_in(window, async move |_, cx| {
-                    panel
-                        .update_in(cx, |panel, window, cx| {
-                            panel.open_or_focus(manifest, wasm_extension.clone(), window, cx);
-                        })
-                        .ok();
-                    // Call back into extension
-                    wasm_extension
-                        .call_run_extension_command(command_id.to_string())
-                        .await
-                        .log_err();
-                })
-                .detach();
-            } else {
-                // Extension not yet loaded — just show the panel
-                workspace.toggle_panel_focus::<ExtensionGuiPanel>(window, cx);
-            }
-        }
-    },
-)
+extension_panel::init(cx);
 ```
 
-**Step 3: Unregister commands on extension uninstall**
+**Step 3: Remove the old `GuiExtensionLoaded` subscription block**
 
-In the existing `cx.subscribe_in(&extension_store, ...)` block, handle `ExtensionUninstalled`:
+Remove the entire `cx.subscribe_in(&extension_store, ...)` block that handles `GuiExtensionLoaded` (currently lines ~420-452). This logic is now inside `extension_panel::init`.
 
-```rust
-if let extension_host::Event::ExtensionUninstalled(extension_id) = event {
-    cx.update_global(|registry: &mut GlobalDynamicCommandRegistry, _| {
-        registry.0.unregister_extension(extension_id);
-    });
-}
-```
+Also remove any standalone `ToggleFocus` registration for `ExtensionGuiPanel` if it exists elsewhere in `zed.rs` (it is now registered inside `extension_panel::init`).
 
 **Step 4: Check**
 ```bash
@@ -512,66 +640,59 @@ cargo check -p zed 2>&1 | grep "^error"
 **Step 5: Commit**
 ```bash
 git add crates/zed/src/zed.rs
-git commit -m "zed: handle OpenExtensionPanel, unregister commands on extension unload"
+git commit -m "zed: delegate extension panel wiring to extension_panel::init"
 ```
 
 ---
 
-## Task 9: Implement `run-extension-command` in `gui-test`
+## Task 11: Implement `run_extension_command` in `gui-test`
 
 **Files:**
-- Modify: `extensions/gui-test/src/lib.rs` (or wherever `gui_init` lives)
+- Modify: `extensions/gui-test/src/lib.rs`
 
-**Step 1: Check current extension code**
-```bash
-find extensions/gui-test/src -name "*.rs" | head -5
-cat extensions/gui-test/src/lib.rs 2>/dev/null | head -50
-```
+**Step 1: Call `register_command` in `fn new()`**
 
-**Step 2: Call `register_command` in `gui_init`**
-
-In the extension's `gui_init` implementation:
 ```rust
-fn gui_init(&mut self) {
+fn new() -> Self {
     zed_extension_api::register_command("open-panel", "open panel");
-    // ... rest of init
+    GuiTest {
+        result_text: "Click a button to call a host action.".to_string(),
+    }
 }
 ```
 
-**Step 3: Handle `run_extension_command`**
+**Step 2: Implement `run_extension_command`**
 
+Add to `impl Extension for GuiTest`:
 ```rust
 fn run_extension_command(&mut self, command_id: &str) -> Result<(), String> {
     match command_id {
-        "open-panel" => {
-            // Host already opened the panel. No-op here, or render initial view.
-            Ok(())
-        }
+        "open-panel" => Ok(()),
         _ => Err(format!("unknown command: {command_id}")),
     }
 }
 ```
 
-**Step 4: Check**
+**Step 3: Check**
 ```bash
 cargo check -p gui-test 2>&1 | grep "^error"
 ```
 
-**Step 5: Commit**
+**Step 4: Commit**
 ```bash
-git add extensions/gui-test/src/
+git add extensions/gui-test/src/lib.rs
 git commit -m "gui-test: register open-panel command and handle run-extension-command"
 ```
 
 ---
 
-## Task 10: Full build and clippy
+## Task 12: Full build and clippy
 
 ```bash
 ./script/clippy 2>&1 | grep "^error" | head -20
 ```
 
-Fix any errors. Then run a full check:
+Fix any errors. Then run a targeted check:
 ```bash
 cargo check -p extension_panel -p extension_host -p command_palette -p command_palette_hooks -p zed 2>&1 | grep "^error"
 ```
@@ -580,11 +701,11 @@ cargo check -p extension_panel -p extension_host -p command_palette -p command_p
 
 ## Verification checklist
 
-- [ ] Status bar footer always shows Extension Panel icon (Blocks)
+- [ ] Status bar footer always shows Extension Panel icon (even before any extension loads)
 - [ ] `ctrl+shift+P` → type "gui_test" → shows `gui_test: open panel`
 - [ ] Selecting command → panel opens, tab added for gui-test
-- [ ] Running command again → focuses existing tab, no duplicate
-- [ ] `run-extension-command` called on extension after panel opens
+- [ ] Running command again → focuses existing tab, no duplicate tab created
+- [ ] `run-extension-command` called on the extension after panel opens
 
 ---
 
@@ -593,12 +714,54 @@ cargo check -p extension_panel -p extension_host -p command_palette -p command_p
 | File | Change |
 |------|--------|
 | `crates/extension_api/wit/since_v0.9.0/extension.wit` | `import register-command`, `export run-extension-command` |
-| `crates/extension_host/src/wasm_host/wit.rs` | implement `register_command` host fn via `on_main_thread` |
-| `crates/extension_host/src/wasm_host.rs` | add `call_run_extension_command` to `WasmExtension` |
-| `crates/extension_host/src/extension_host.rs:441` | add `wasm_extension_for_id` |
+| `crates/extension_host/src/wasm_host/wit/since_v0_9_0.rs` | implement `register_command` in `impl PanelUiImports for WasmState` |
+| `crates/extension_host/src/wasm_host/wit.rs` | add `call_run_extension_command` to `impl Extension` |
+| `crates/extension_host/src/wasm_host.rs` | add `command_registrations_tx` field; add `call_run_extension_command` to `WasmExtension` |
+| `crates/extension_host/src/extension_host.rs` | add `Event::ExtensionCommandRegistered`; create channel in `new`; add `wasm_extension_for_id` |
 | `crates/command_palette_hooks/src/command_palette_hooks.rs` | `DynamicCommand`, `DynamicCommandRegistry`, `GlobalDynamicCommandRegistry` |
 | `crates/command_palette/src/command_palette.rs` | read registry, create `OpenExtensionPanel` actions |
 | `crates/command_palette/Cargo.toml` | add `extension_panel` dep |
-| `crates/extension_panel/src/extension_panel.rs` | `OpenExtensionPanel` action, `open_or_focus` |
-| `crates/zed/src/zed.rs` | simplify handler, register action, unregister on unload |
+| `crates/extension_panel/src/extension_panel.rs` | `OpenExtensionPanel` action, `open_or_focus`, `pub fn init(cx)` |
+| `crates/extension_panel/Cargo.toml` | add `command_palette_hooks` dep |
+| `crates/zed/src/zed.rs` | call `extension_panel::init(cx)`; remove old `GuiExtensionLoaded` subscription |
 | `extensions/gui-test/src/lib.rs` | call `register_command`, implement `run_extension_command` |
+
+---
+
+## Architecture: data flow
+
+### Registration (extension loads)
+
+```
+WASM extension calls register_command("open-panel", "open panel")
+  → since_v0_9_0.rs: WasmState::register_command
+      sends (extension_id, "gui_test: open panel", "open-panel") to channel
+  → ExtensionStore channel task
+      cx.emit(Event::ExtensionCommandRegistered { ... })
+  → extension_panel::init subscribe_in callback
+      GlobalDynamicCommandRegistry.register(DynamicCommand { ... })
+```
+
+### Invocation (user selects command)
+
+```
+ctrl+shift+P → "gui_test: open panel"
+  ← command_palette reads GlobalDynamicCommandRegistry
+  → dispatch OpenExtensionPanel { extension_id: "gui-test", command_id: "open-panel" }
+  → extension_panel::init register_action handler:
+      get wasm_extension from ExtensionStore::wasm_extension_for_id
+      panel.open_or_focus(manifest, wasm_extension)
+        → if tab exists: focus it
+        → if not: add_view + emit PanelEvent::Activate
+      wasm_extension.call_run_extension_command("open-panel")
+        → extension handles it (no-op for "open-panel")
+```
+
+### Unregistration (extension unloads)
+
+```
+Extension unloads → Event::ExtensionUninstalled("gui-test")
+  → extension_panel::init subscribe_in callback
+      GlobalDynamicCommandRegistry.unregister_extension("gui-test")
+  → commands disappear from palette immediately
+```

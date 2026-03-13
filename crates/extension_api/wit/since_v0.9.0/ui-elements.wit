@@ -1,0 +1,317 @@
+package zed:extension;
+
+interface ui-elements {
+
+    // ── Lengths ───────────────────────────────────────────────────────────
+    // Mirrors gpui::Length
+    variant length {
+        px(f32),
+        rems(f32),
+        relative(f32),
+        auto,
+        fr(f32),
+    }
+
+    // Mirrors gpui::DefiniteLength (no Auto or Fr)
+    variant definite-length {
+        px(f32),
+        rems(f32),
+        relative(f32),
+    }
+
+    // Mirrors gpui::AbsoluteLength (px or rems, used for borders/shadows)
+    variant absolute-length {
+        px(f32),
+        rems(f32),
+    }
+
+    // ── Geometry ──────────────────────────────────────────────────────────
+    record edges-length {
+        top:    length,
+        right:  length,
+        bottom: length,
+        left:   length,
+    }
+
+    record edges-absolute {
+        top:    absolute-length,
+        right:  absolute-length,
+        bottom: absolute-length,
+        left:   absolute-length,
+    }
+
+    record corners-absolute {
+        top-left:     absolute-length,
+        top-right:    absolute-length,
+        bottom-right: absolute-length,
+        bottom-left:  absolute-length,
+    }
+
+    record point-f32 { x: f32, y: f32 }
+
+    // ── Color ─────────────────────────────────────────────────────────────
+    record hsla { h: f32, s: f32, l: f32, a: f32 }
+
+    // Mirrors gpui semantic colors. Semantic variants map to
+    // cx.theme().colors().* at render time so the UI always follows the
+    // active Zed theme.
+    variant color {
+        // Raw HSLA — use only when no semantic token fits.
+        hsla(hsla),
+        // Semantic — follow Zed theme automatically.
+        text,
+        text-muted,
+        text-disabled,
+        text-accent,
+        text-placeholder,
+        background,
+        surface-background,
+        elevated-surface-background,
+        panel-background,
+        border,
+        border-muted,
+        border-focused,
+        border-transparent,
+        element-background,
+        element-hover,
+        element-selected,
+        element-active,
+        element-disabled,
+        ghost-element-background,
+        ghost-element-hover,
+        ghost-element-selected,
+        status-error,
+        status-warning,
+        status-success,
+        status-info,
+        editor-background,
+        accent,
+        // Fully transparent (no-op fill / no border).
+        transparent,
+    }
+
+    // ── Background ────────────────────────────────────────────────────────
+    variant background {
+        color(color),
+    }
+
+    // ── Box shadow ────────────────────────────────────────────────────────
+    record box-shadow {
+        color:  hsla,
+        offset: point-f32,
+        blur:   f32,
+        spread: f32,
+    }
+
+    // ── Enums mirroring GPUI ──────────────────────────────────────────────
+    enum display-type   { block, flex }
+    enum position-type  { relative, absolute }
+
+    enum flex-direction {
+        row, column, row-reverse, column-reverse
+    }
+    enum flex-wrap { no-wrap, wrap, wrap-reverse }
+
+    enum align-items {
+        start, end, flex-start, flex-end,
+        center, baseline, stretch
+    }
+    enum align-content {
+        start, end, flex-start, flex-end,
+        center, stretch, space-between, space-around, space-evenly
+    }
+    enum justify-content {
+        start, end, flex-start, flex-end,
+        center, stretch, space-between, space-around, space-evenly
+    }
+
+    enum overflow-type   { visible, hidden, scroll }
+    enum visibility-type { visible, hidden }
+
+    enum cursor-style {
+        default, pointer, text, crosshair,
+        not-allowed, resize-row, resize-col,
+        resize-ew, resize-ns, resize-nesw, resize-nwse,
+        grab, grabbing, zoom-in, zoom-out, wait, progress,
+    }
+
+    enum font-weight {
+        thin, extra-light, light, normal,
+        medium, semi-bold, bold, extra-bold, black
+    }
+    enum font-style   { normal, italic }
+    enum text-align   { left, center, right, justify }
+    enum white-space  { normal, nowrap, pre, pre-wrap }
+    enum text-overflow      { clip, ellipsis }
+    enum text-decoration    { none, underline, strikethrough }
+
+    // ── Style ─────────────────────────────────────────────────────────────
+    // Mirrors gpui::StyleRefinement — all fields are option so only
+    // specified values are serialized across the WIT boundary.
+    record style {
+        // Layout
+        display:         option<display-type>,
+        position:        option<position-type>,
+        visibility:      option<visibility-type>,
+        // Size
+        width:           option<length>,
+        height:          option<length>,
+        min-width:       option<definite-length>,
+        min-height:      option<definite-length>,
+        max-width:       option<definite-length>,
+        max-height:      option<definite-length>,
+        // Absolute positioning offsets (used when position = absolute)
+        top:             option<length>,
+        right:           option<length>,
+        bottom:          option<length>,
+        left:            option<length>,
+        // Flex container
+        flex-direction:  option<flex-direction>,
+        flex-wrap:       option<flex-wrap>,
+        align-items:     option<align-items>,
+        align-content:   option<align-content>,
+        justify-content: option<justify-content>,
+        gap:             option<definite-length>,
+        column-gap:      option<definite-length>,
+        row-gap:         option<definite-length>,
+        // Flex item
+        flex-grow:       option<f32>,
+        flex-shrink:     option<f32>,
+        flex-basis:      option<length>,
+        align-self:      option<align-items>,
+        // Spacing
+        padding:         option<edges-length>,
+        margin:          option<edges-length>,
+        // Background + opacity
+        background:      option<background>,
+        opacity:         option<f32>,
+        // Border
+        border-widths:   option<edges-absolute>,
+        border-color:    option<color>,
+        corner-radii:    option<corners-absolute>,
+        // Shadows (list because multiple shadows are allowed)
+        box-shadows:     list<box-shadow>,
+        // Text
+        text-size:       option<absolute-length>,
+        text-color:      option<color>,
+        font-weight:     option<font-weight>,
+        font-style:      option<font-style>,
+        font-family:     option<string>,
+        text-align:      option<text-align>,
+        line-height:     option<definite-length>,
+        letter-spacing:  option<absolute-length>,
+        white-space:     option<white-space>,
+        text-overflow:   option<text-overflow>,
+        text-decoration: option<text-decoration>,
+        // Overflow + scroll
+        overflow-x:      option<overflow-type>,
+        overflow-y:      option<overflow-type>,
+        // Misc
+        cursor:          option<cursor-style>,
+        z-index:         option<u32>,
+        // false = pointer events pass through this element
+        pointer-events:  option<bool>,
+    }
+
+    // ── Event subscription flags ───────────────────────────────────────────
+    // Set to true for each event type the extension wants to receive on this
+    // element. Host only sends events for flags that are set.
+    record event-flags {
+        on-click:        bool,
+        on-double-click: bool,
+        on-right-click:  bool,
+        on-hover:        bool,
+        on-mouse-down:   bool,
+        on-mouse-up:     bool,
+        on-mouse-move:   bool,
+        on-scroll-wheel: bool,
+        on-key-down:     bool,
+        on-key-up:       bool,
+        on-focus-in:     bool,
+        on-focus-out:    bool,
+        on-drag:         bool,
+        on-drop:         bool,
+    }
+
+    // ── Icon ──────────────────────────────────────────────────────────────
+    variant icon-source {
+        // Named icon from Zed's built-in set (e.g. "check", "folder").
+        named(string),
+        // Asset path to a custom SVG bundled with the extension.
+        path(string),
+    }
+
+    // ── Element nodes ─────────────────────────────────────────────────────
+    //
+    // WIT does not allow recursive types, so the element tree is represented
+    // as a flat array. Each node holds indices (u32) into ui-tree.nodes
+    // rather than embedded child nodes. The host reconstructs the tree by
+    // following those indices.
+
+    record div-node {
+        id:              option<string>,
+        // Opaque ID returned by create-focus-handle; makes the element
+        // focusable and keyboard-navigable.
+        focus-handle-id: option<u32>,
+        style:           style,
+        events:          event-flags,
+        // Simple text tooltip shown on hover.
+        tooltip:         option<string>,
+        // Indices into ui-tree.nodes for child elements.
+        children:        list<u32>,
+    }
+
+    record text-node {
+        content: string,
+        style:   style,
+    }
+
+    record img-node {
+        id:     option<string>,
+        src:    string,
+        style:  style,
+        events: event-flags,
+    }
+
+    record svg-node {
+        source: icon-source,
+        color:  option<color>,
+        style:  style,
+    }
+
+    record input-node {
+        id:          string,
+        value:       string,
+        placeholder: option<string>,
+        disabled:    bool,
+        style:       style,
+    }
+
+    // Virtual list — host renders only visible items on-demand by calling the
+    // gui-render-list-item export. Requires uniform item height.
+    record uniform-list-node {
+        id:          string,
+        item-count:  u32,
+        // Uniform height of every item in logical pixels.
+        item-height: f32,
+        style:       style,
+        // When true the list fills its parent's width.
+        fill-width:  bool,
+    }
+
+    variant ui-node {
+        div(div-node),
+        text(text-node),
+        img(img-node),
+        svg(svg-node),
+        input(input-node),
+        uniform-list(uniform-list-node),
+    }
+
+    // Flat tree representation avoiding recursive WIT types.
+    // nodes[root] is the root element. div-node.children are indices into nodes.
+    record ui-tree {
+        nodes: list<ui-node>,
+        root:  u32,
+    }
+}
