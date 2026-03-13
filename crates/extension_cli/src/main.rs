@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let fs = Arc::new(RealFs::new(None, gpui_platform::background_executor()));
-    let engine = wasmtime::Engine::default();
+    let engine = tree_sitter::wasmtime::Engine::default();
     let mut wasm_store = WasmStore::new(&engine)?;
 
     let extension_path = args

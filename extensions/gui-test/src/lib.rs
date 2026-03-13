@@ -50,6 +50,7 @@ impl Extension for GuiTest {
                                 .bg(ui::color_accent())
                                 .text_color(ui::color_background())
                                 .cursor_pointer()
+                                .on_click(|_| {})
                                 .child(Label::new("Increment")),
                         )
                         .child(
@@ -61,6 +62,7 @@ impl Extension for GuiTest {
                                 .border_1()
                                 .border_color(ui::color_border())
                                 .cursor_pointer()
+                                .on_click(|_| {})
                                 .child(Label::new("Reset")),
                         ),
                 ),

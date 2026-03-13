@@ -55,9 +55,18 @@ impl ExtensionGuiView {
     ) -> Self {
         let wasm_for_init = wasm.clone();
         cx.spawn(async move |this, cx| {
-            wasm_for_init.call_gui_init().await.log_err();
+            log::info!("extension gui: calling gui_init");
+            if let Err(err) = wasm_for_init.call_gui_init().await {
+                log::error!("gui_init failed: {err}");
+            }
+            log::info!("extension gui: calling gui_render");
             match wasm_for_init.call_gui_render().await {
                 Ok(tree) => {
+                    log::info!(
+                        "extension gui: gui_render ok, nodes={}, root={}",
+                        tree.nodes.len(),
+                        tree.root
+                    );
                     this.update(cx, |view, cx| {
                         view.ui_tree = Some(tree);
                         cx.notify();
@@ -114,7 +123,10 @@ impl Render for ExtensionGuiView {
         match &self.ui_tree {
             Some(tree) => {
                 let tree = tree.clone();
-                ui_renderer::render_ui_tree(&tree, on_event, cx).into_any_element()
+                div()
+                    .size_full()
+                    .child(ui_renderer::render_ui_tree(&tree, on_event, cx))
+                    .into_any_element()
             }
             None => div()
                 .size_full()
@@ -228,24 +240,6 @@ fn new_extension_pane(
         pane.display_nav_history_buttons(None);
         pane.set_should_display_tab_bar(|_, _| true);
         pane.set_zoom_out_on_close(false);
-
-        // TODO: Re-enable custom drop handling when the API is available
-        // pane.set_custom_drop_handle(cx, move |pane, dropped_item, _window, cx| {
-        //     if let Some(tab) = dropped_item.downcast_ref::<DraggedTab>() {
-        //         let item = if tab.pane == cx.entity() {
-        //             pane.item_for_index(tab.ix)
-        //         } else {
-        //             tab.pane.read(cx).item_for_index(tab.ix)
-        //         };
-        //         if let Some(item) = item {
-        //             if item.downcast::<ExtensionGuiView>().is_some() {
-        //                 return ControlFlow::Continue(());
-        //             }
-        //         }
-        //     }
-        //     ControlFlow::Break(())
-        // });
-
         pane
     })
 }
@@ -336,7 +330,6 @@ impl Render for ExtensionGuiPanel {
         div().size_full().child(self.active_pane.clone())
     }
 }
-
 
 /// Registers `ExtensionGuiPanel` actions and subscribes to `ExtensionStore` events so that:
 /// - Commands registered by WASM extensions appear in the command palette.
