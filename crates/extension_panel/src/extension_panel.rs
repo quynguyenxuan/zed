@@ -537,8 +537,14 @@ impl Render for ExtensionGuiView {
                 self.ensure_focus_handles(&tree, cx);
 
                 let focus_handles = self.focus_handles.clone();
+
                 div()
                     .size_full()
+                    .track_focus(&self.focus_handle)
+                    .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                        // Capture focus when clicking anywhere in extension panel
+                        window.focus(&this.focus_handle, cx);
+                    }))
                     .child(ui_renderer::render_ui_tree(&tree, on_event, focus_handles, window, cx))
                     .into_any_element()
             }

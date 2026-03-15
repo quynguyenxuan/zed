@@ -172,6 +172,57 @@ GPUI's IME support requires implementing the `EntityInputHandler` trait which pr
 - `crates/gpui/src/input.rs` `EntityInputHandler` trait (lines 10-80)
 - `crates/gpui/src/platform.rs` `InputHandler` trait (lines 1090-1160)
 
+### 9. Copy/Paste & Clipboard (0%)
+
+**Status:** ❌ Not implemented
+
+**Blocker:** Requires `window.handle_input()` registration to receive OS clipboard events. Current implementation is stateless rendering function, not an Entity with Context.
+
+**Workaround:** Extensions can implement custom clipboard via commands:
+```rust
+// Extension side
+register_command("copy-text", || { /* get selected text */ });
+register_command("paste-text", || { /* insert from clipboard */ });
+```
+
+### 10. Focus Management Issue
+
+**Problem:** Editor in workspace always captures focus, extension inputs lose focus immediately
+
+**Root Cause:**
+- Editor registers `InputHandler` with `window.handle_input()`
+- Workspace prioritizes Editor over panels
+- Extension inputs are just divs, not registered input handlers
+
+**Solution Options:**
+
+**Option A: Panel Focus Priority (Recommended)**
+```rust
+// In extension_panel.rs render()
+div()
+    .track_focus(&self.focus_handle)  // Panel focus
+    .on_click(cx.listener(|this, _, window, cx| {
+        window.focus(&this.focus_handle); // Capture focus on click
+    }))
+    .child(/* extension UI */)
+```
+
+**Option B: Modal/Overlay**
+- Open input in modal overlay
+- Modal has focus trap
+- Works but adds UI complexity
+
+**Option C: Custom Input Panel**
+- Separate panel for text input (like command palette)
+- Full focus control
+- Best UX but more implementation
+
+**Current State:** Focus issue documented but not fixed. Users can click outside editor to use extension inputs.
+
+**Files:**
+- `crates/extension_panel/src/extension_panel.rs` (would need focus management)
+- `crates/workspace/src/workspace.rs` (focus priority system)
+
 ---
 
 ## 🏗️ Architecture Notes
