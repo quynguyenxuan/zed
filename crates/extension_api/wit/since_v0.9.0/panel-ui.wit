@@ -10,8 +10,16 @@ world panel-ui {
     /// UI element type definitions.
     import ui-elements;
 
+    /// Pub-sub messaging between extensions and between extensions and the host.
+    import pub-sub;
+
+    /// Request-response queries between extensions and between extensions and the host.
+    import query;
+
     use gui.{theme, ui-event};
     use ui-elements.{ui-tree};
+    use pub-sub.{pub-sub-event};
+    use query.{query-response};
 
     /// Called once when the GUI panel is first shown.
     export gui-init: func();
@@ -34,4 +42,11 @@ world panel-ui {
     /// Host calls this to render a single item in a uniform-list.
     /// list-id matches the id field of the uniform-list-node.
     export gui-render-list-item: func(list-id: string, index: u32) -> ui-tree;
+
+    /// Called when a pub-sub event is delivered to a topic this extension subscribed to.
+    export on-pub-sub-event: func(event: pub-sub-event);
+
+    /// Called when a query arrives for a topic this extension registered as a handler.
+    /// Must return a JSON response string, or an error string.
+    export on-query: func(query-id: u64, topic: string, source: string, data: string) -> result<string, string>;
 }

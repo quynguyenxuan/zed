@@ -1,0 +1,23 @@
+package zed:extension;
+
+interface pub-sub {
+    record pub-sub-event {
+        /// Topic this event was published on.
+        topic: string,
+        /// Extension ID of the publisher, or "host" for host-originated events.
+        source: string,
+        /// JSON-encoded payload.
+        data: string,
+    }
+
+    /// Subscribes to events on the given topic.
+    /// Returns a subscription ID that can be passed to `unsubscribe`.
+    subscribe: func(topic: string) -> result<u64, string>;
+
+    /// Cancels a subscription previously created with `subscribe`.
+    unsubscribe: func(subscription-id: u64) -> result<_, string>;
+
+    /// Publishes an event on the given topic.
+    /// All extensions subscribed to this topic will receive it via `on-pub-sub-event`.
+    publish: func(topic: string, data: string) -> result<_, string>;
+}

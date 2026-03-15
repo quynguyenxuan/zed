@@ -1,0 +1,21 @@
+package zed:extension;
+
+interface query {
+    record query-response {
+        /// Extension ID of the handler that responded.
+        source: string,
+        /// JSON response payload.
+        data: string,
+    }
+
+    /// Sends a query to all registered handlers for the given topic.
+    /// Waits up to `timeout-ms` milliseconds and returns all responses received.
+    query: func(topic: string, data: string, timeout-ms: u32) -> result<list<query-response>, string>;
+
+    /// Registers this extension as a handler for queries on the given topic.
+    /// Returns a handler ID that can be passed to `unregister-query-handler`.
+    register-query-handler: func(topic: string) -> result<u64, string>;
+
+    /// Unregisters a query handler previously created with `register-query-handler`.
+    unregister-query-handler: func(handler-id: u64) -> result<_, string>;
+}

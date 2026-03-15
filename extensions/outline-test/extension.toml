@@ -1,6 +1,6 @@
-id = "gui-test"
-name = "GUI Test"
-description = "A test extension that renders a simple GUI panel."
+id = "outline-test"
+name = "Outline Test"
+description = "A test extension that shows a symbol outline for the active file."
 version = "0.1.0"
 schema_version = 1
 authors = ["Zed Dev <dev@zed.dev>"]
@@ -11,5 +11,5 @@ min_zed_api = "0.9.0"
 
 [[capabilities]]
 kind = "process:exec"
-command = "git"
-args = ["-C", "**"]
+command = "cat"
+args = ["**"]

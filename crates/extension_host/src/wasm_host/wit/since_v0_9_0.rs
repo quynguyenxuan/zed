@@ -240,25 +240,214 @@ impl PanelUiImports for WasmState {
             .ok();
         Ok(())
     }
+
+    async fn execute_command(
+        &mut self,
+        command: String,
+        args: Option<String>,
+    ) -> wasmtime::Result<Result<String, String>> {
+        let Some(tx) = &self.command_execution_tx else {
+            return Ok(Err("Command execution not available".to_string()));
+        };
+
+        let (response_tx, response_rx) = futures::channel::oneshot::channel();
+
+        if tx.unbounded_send(crate::wasm_host::CommandExecutionRequest::ExecuteCommand {
+            command,
+            args,
+            response_tx,
+        }).is_err() {
+            return Ok(Err("Failed to send command execution request".to_string()));
+        }
+
+        match response_rx.await {
+            Ok(result) => Ok(result),
+            Err(_) => Ok(Err("Command execution channel closed".to_string())),
+        }
+    }
+
+    async fn execute_slash_command(
+        &mut self,
+        command: String,
+        args: Vec<String>,
+    ) -> wasmtime::Result<Result<String, String>> {
+        let Some(tx) = &self.command_execution_tx else {
+            return Ok(Err("Slash command execution not available".to_string()));
+        };
+
+        let (response_tx, response_rx) = futures::channel::oneshot::channel();
+
+        if tx.unbounded_send(crate::wasm_host::CommandExecutionRequest::ExecuteSlashCommand {
+            command,
+            args,
+            response_tx,
+        }).is_err() {
+            return Ok(Err("Failed to send slash command execution request".to_string()));
+        }
+
+        match response_rx.await {
+            Ok(result) => Ok(result),
+            Err(_) => Ok(Err("Slash command execution channel closed".to_string())),
+        }
+    }
 }
 
 impl ui_elements::Host for WasmState {}
 
+impl query::Host for WasmState {
+    async fn query(
+        &mut self,
+        topic: String,
+        data: String,
+        timeout_ms: u32,
+    ) -> wasmtime::Result<Result<Vec<query::QueryResponse>, String>> {
+        let Some(tx) = &self.command_execution_tx else {
+            return Ok(Err("Query not available".to_string()));
+        };
+        let source_extension_id = self.manifest.id.clone();
+        let (response_tx, response_rx) = futures::channel::oneshot::channel();
+        if tx
+            .unbounded_send(crate::wasm_host::CommandExecutionRequest::QueryRequest {
+                topic,
+                source_extension_id,
+                data,
+                timeout_ms,
+                response_tx,
+            })
+            .is_err()
+        {
+            return Ok(Err("Failed to send query request".to_string()));
+        }
+        match response_rx.await {
+            Ok(Ok(responses)) => Ok(Ok(responses
+                .into_iter()
+                .map(|r| query::QueryResponse {
+                    source: r.source,
+                    data: r.data,
+                })
+                .collect())),
+            Ok(Err(e)) => Ok(Err(e)),
+            Err(_) => Ok(Err("Channel closed".to_string())),
+        }
+    }
+
+    async fn register_query_handler(
+        &mut self,
+        topic: String,
+    ) -> wasmtime::Result<Result<u64, String>> {
+        let Some(tx) = &self.command_execution_tx else {
+            return Ok(Err("Query not available".to_string()));
+        };
+        let Some(query_tx) = &self.query_tx else {
+            return Ok(Err("Query delivery channel not available".to_string()));
+        };
+        let query_tx = query_tx.clone();
+        let source_extension_id = self.manifest.id.clone();
+        let (response_tx, response_rx) = futures::channel::oneshot::channel();
+        if tx
+            .unbounded_send(crate::wasm_host::CommandExecutionRequest::QueryRegisterHandler {
+                topic,
+                source_extension_id,
+                query_tx,
+                response_tx,
+            })
+            .is_err()
+        {
+            return Ok(Err("Failed to register query handler".to_string()));
+        }
+        Ok(response_rx.await.unwrap_or_else(|_| Err("Channel closed".to_string())))
+    }
+
+    async fn unregister_query_handler(
+        &mut self,
+        handler_id: u64,
+    ) -> wasmtime::Result<Result<(), String>> {
+        let Some(tx) = &self.command_execution_tx else {
+            return Ok(Err("Query not available".to_string()));
+        };
+        let (response_tx, response_rx) = futures::channel::oneshot::channel();
+        if tx
+            .unbounded_send(crate::wasm_host::CommandExecutionRequest::QueryUnregisterHandler {
+                handler_id,
+                response_tx,
+            })
+            .is_err()
+        {
+            return Ok(Err("Failed to send unregister request".to_string()));
+        }
+        Ok(response_rx.await.unwrap_or_else(|_| Err("Channel closed".to_string())))
+    }
+}
+
+
+impl pub_sub::Host for WasmState {
+    async fn subscribe(&mut self, topic: String) -> wasmtime::Result<Result<u64, String>> {
+        let Some(tx) = &self.command_execution_tx else {
+            return Ok(Err("Pub-sub not available".to_string()));
+        };
+        let Some(event_tx) = &self.pub_sub_event_tx else {
+            return Ok(Err("Pub-sub event channel not available".to_string()));
+        };
+        let event_tx = event_tx.clone();
+        let source_extension_id = self.manifest.id.clone();
+        let (response_tx, response_rx) = futures::channel::oneshot::channel();
+        if tx
+            .unbounded_send(crate::wasm_host::CommandExecutionRequest::PubSubSubscribe {
+                topic,
+                source_extension_id,
+                event_tx,
+                response_tx,
+            })
+            .is_err()
+        {
+            return Ok(Err("Failed to send subscribe request".to_string()));
+        }
+        Ok(response_rx.await.unwrap_or_else(|_| Err("Channel closed".to_string())))
+    }
+
+    async fn unsubscribe(&mut self, subscription_id: u64) -> wasmtime::Result<Result<(), String>> {
+        let Some(tx) = &self.command_execution_tx else {
+            return Ok(Err("Pub-sub not available".to_string()));
+        };
+        let (response_tx, response_rx) = futures::channel::oneshot::channel();
+        if tx
+            .unbounded_send(crate::wasm_host::CommandExecutionRequest::PubSubUnsubscribe {
+                subscription_id,
+                response_tx,
+            })
+            .is_err()
+        {
+            return Ok(Err("Failed to send unsubscribe request".to_string()));
+        }
+        Ok(response_rx.await.unwrap_or_else(|_| Err("Channel closed".to_string())))
+    }
+
+    async fn publish(
+        &mut self,
+        topic: String,
+        data: String,
+    ) -> wasmtime::Result<Result<(), String>> {
+        let Some(tx) = &self.command_execution_tx else {
+            return Ok(Err("Pub-sub not available".to_string()));
+        };
+        let source_extension_id = self.manifest.id.clone();
+        let (response_tx, response_rx) = futures::channel::oneshot::channel();
+        if tx
+            .unbounded_send(crate::wasm_host::CommandExecutionRequest::PubSubPublish {
+                topic,
+                source_extension_id,
+                data,
+                response_tx,
+            })
+            .is_err()
+        {
+            return Ok(Err("Failed to send publish request".to_string()));
+        }
+        Ok(response_rx.await.unwrap_or_else(|_| Err("Channel closed".to_string())))
+    }
+}
+
 impl gui::Host for WasmState {
-    async fn set_view(&mut self, view_json: String) -> wasmtime::Result<()> {
-        if let Some(tx) = &self.gui_panel_tx {
-            let _ = tx.unbounded_send(crate::wasm_host::GuiPanelMessage::SetView(view_json));
-        }
-        Ok(())
-    }
-
-    async fn set_view_tree(&mut self, tree: ui_elements::UiTree) -> wasmtime::Result<()> {
-        if let Some(tx) = &self.gui_panel_tx {
-            let _ = tx.unbounded_send(crate::wasm_host::GuiPanelMessage::SetViewTree(tree));
-        }
-        Ok(())
-    }
-
     async fn create_focus_handle(&mut self) -> wasmtime::Result<u32> {
         let id = self.next_focus_handle_id;
         self.next_focus_handle_id = self.next_focus_handle_id.saturating_add(1);
@@ -268,7 +457,7 @@ impl gui::Host for WasmState {
     async fn request_focus(&mut self, handle_id: u32) -> wasmtime::Result<()> {
         if let Some(tx) = &self.gui_panel_tx {
             let _ =
-                tx.unbounded_send(crate::wasm_host::GuiPanelMessage::RequestFocus(handle_id));
+                tx.send(crate::wasm_host::GuiPanelMessage::RequestFocus(handle_id));
         }
         Ok(())
     }
@@ -279,14 +468,14 @@ impl gui::Host for WasmState {
 
     async fn emit(&mut self, name: String, data: String) -> wasmtime::Result<()> {
         if let Some(tx) = &self.gui_panel_tx {
-            let _ = tx.unbounded_send(crate::wasm_host::GuiPanelMessage::Emit { name, data });
+            let _ = tx.send(crate::wasm_host::GuiPanelMessage::Emit { name, data });
         }
         Ok(())
     }
 
     async fn request_data(&mut self, key: String) -> wasmtime::Result<()> {
         if let Some(tx) = &self.gui_panel_tx {
-            let _ = tx.unbounded_send(crate::wasm_host::GuiPanelMessage::RequestData(key));
+            let _ = tx.send(crate::wasm_host::GuiPanelMessage::RequestData(key));
         }
         Ok(())
     }
@@ -298,7 +487,7 @@ impl gui::Host for WasmState {
         params: String,
     ) -> wasmtime::Result<Result<(), String>> {
         if let Some(tx) = &self.gui_panel_tx {
-            let _ = tx.unbounded_send(crate::wasm_host::GuiPanelMessage::Call {
+            let _ = tx.send(crate::wasm_host::GuiPanelMessage::Call {
                 key,
                 method,
                 params,
@@ -306,4 +495,5 @@ impl gui::Host for WasmState {
         }
         Ok(Ok(()))
     }
+
 }

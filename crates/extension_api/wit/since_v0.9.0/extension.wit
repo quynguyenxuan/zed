@@ -54,6 +54,14 @@ world extension {
     /// When the user invokes the command, Zed calls `run-extension-command` with the given id.
     import register-command: func(id: string, label: string);
 
+    /// Executes a workspace command (e.g., "editor::SelectAll") and returns the result as JSON.
+    /// The args parameter is an optional JSON string containing command arguments.
+    import execute-command: func(command: string, args: option<string>) -> result<string, string>;
+
+    /// Executes a slash command (e.g., "file") and returns the output.
+    /// The args parameter is a list of command arguments.
+    import execute-slash-command: func(command: string, args: list<string>) -> result<string, string>;
+
     /// Downloads a file from the given URL and saves it to the given path within the extension's
     /// working directory.
     ///

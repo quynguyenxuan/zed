@@ -18,7 +18,7 @@ pub use serde_json;
 pub use wit::{
     CodeLabel, CodeLabelSpan, CodeLabelSpanLiteral, Command, DownloadedFileType, EnvVars,
     KeyValueStore, LanguageServerInstallationStatus, Project, Range, Worktree, download_file,
-    make_file_executable, register_command,
+    execute_command, execute_slash_command, make_file_executable, register_command,
     zed::extension::context_server::ContextServerConfiguration,
     zed::extension::dap::{
         AttachRequest, BuildTaskDefinition, BuildTaskDefinitionTemplatePayload, BuildTaskTemplate,
@@ -47,11 +47,119 @@ pub use wit::{
 #[doc(hidden)]
 pub use wit::Guest;
 
+pub use extension_macros::{query_dispatch, query_handler};
+
+
+/// Constructs for subscribing to and publishing extension events.
+pub mod pub_sub {
+    pub use crate::wit::zed::extension::pub_sub::{PubSubEvent, publish, subscribe, unsubscribe};
+}
+
+/// Constructs for request-response queries between extensions.
+pub mod query {
+    use crate::wit::zed::extension::query::query as wit_query;
+    pub use crate::wit::zed::extension::query::{
+        QueryResponse, register_query_handler, unregister_query_handler,
+    };
+
+    pub const DEFAULT_TIMEOUT_MS: u32 = 2000;
+
+    /// Sends a raw query to all registered handlers for the given topic.
+    /// `timeout_ms` defaults to [`DEFAULT_TIMEOUT_MS`] when `None`.
+    pub fn query(
+        topic: &str,
+        data: &str,
+        timeout_ms: impl Into<Option<u32>>,
+    ) -> Result<Vec<QueryResponse>, String> {
+        wit_query(topic, data, timeout_ms.into().unwrap_or(DEFAULT_TIMEOUT_MS))
+    }
+
+    /// Defines a typed query request/response pair.
+    ///
+    /// Implement this on a unit struct to describe a specific query topic.
+    /// Both request and response are serialized as JSON over the wire.
+    ///
+    /// # Example
+    /// ```rust
+    /// struct GitStatus;
+    /// impl query::Query for GitStatus {
+    ///     type Request = ();
+    ///     type Response = GitStatusResponse;
+    ///     const TOPIC: &'static str = "git.status";
+    /// }
+    /// ```
+    pub trait Query {
+        /// Request payload. Use `()` for queries with no arguments.
+        type Request: serde::Serialize;
+        /// Response payload returned by handlers.
+        type Response: serde::de::DeserializeOwned;
+        /// Topic string used to route the query.
+        const TOPIC: &'static str;
+    }
+
+    /// Sends a typed query, serializing the request and deserializing each
+    /// handler's response. Handler responses must be JSON-encoded with the same
+    /// `Response` type.
+    pub fn typed_query<Q: Query>(
+        request: &Q::Request,
+        timeout_ms: impl Into<Option<u32>>,
+    ) -> Result<Vec<Q::Response>, String> {
+        let data = serde_json::to_string(request).map_err(|e| e.to_string())?;
+        let responses = query(Q::TOPIC, &data, timeout_ms)?;
+        responses
+            .into_iter()
+            .map(|r| serde_json::from_str::<Q::Response>(&r.data).map_err(|e| e.to_string()))
+            .collect()
+    }
+
+    /// Deserializes `data` as `Req`, calls `f`, and serializes the `Res` result
+    /// back to a JSON string. Use this inside `on_query` to implement a
+    /// type-safe handler without manually building JSON strings.
+    ///
+    /// # Example
+    /// ```rust
+    /// fn on_query(&mut self, _id: u64, topic: String, _src: String, data: String) -> Result<String, String> {
+    ///     match topic.as_str() {
+    ///         "git.status" => query::respond::<(), GitStatusResponse, _>(&data, |_| {
+    ///             Ok(GitStatusResponse { branch: "main".into(), staged: 0, unstaged: 1 })
+    ///         }),
+    ///         _ => Err(format!("unknown topic: {topic}")),
+    ///     }
+    /// }
+    /// ```
+    pub fn respond<Req, Res, F>(data: &str, f: F) -> Result<String, String>
+    where
+        Req: serde::de::DeserializeOwned,
+        Res: serde::Serialize,
+        F: FnOnce(Req) -> Result<Res, String>,
+    {
+        let request = serde_json::from_str::<Req>(data).map_err(|e| e.to_string())?;
+        let response = f(request)?;
+        serde_json::to_string(&response).map_err(|e| e.to_string())
+    }
+
+    /// Built-in query: the absolute path of the currently active editor file.
+    pub struct ZedActiveFile;
+    impl Query for ZedActiveFile {
+        type Request = ();
+        type Response = String;
+        const TOPIC: &'static str = "zed.active-file";
+    }
+
+    /// Built-in query: the absolute path of the project root (first worktree).
+    pub struct ZedProjectRoot;
+    impl Query for ZedProjectRoot {
+        type Request = ();
+        type Response = String;
+        const TOPIC: &'static str = "zed.project-root";
+    }
+}
+
 /// Constructs for interacting with the extension GUI panel.
 pub mod gui {
     pub use crate::wit::zed::extension::gui::{
         Color, Theme, ThemeColors, UiEvent, call, create_focus_handle, drop_focus_handle, emit,
-        request_data, request_focus, set_view, set_view_tree,
+        request_data, request_focus,
     };
 }
 
@@ -340,6 +448,20 @@ pub trait Extension: Send + Sync {
         Ok(())
     }
 
+    /// Called when a pub-sub event is delivered to a topic this extension subscribed to.
+    fn on_pub_sub_event(&mut self, _event: pub_sub::PubSubEvent) {}
+
+    /// Called when a query is sent to a topic this extension registered as a handler for.
+    fn on_query(
+        &mut self,
+        _query_id: u64,
+        _topic: String,
+        _source: String,
+        _data: String,
+    ) -> Result<String, String> {
+        Err("query not handled".to_string())
+    }
+
     /// Dispatches a named host action. The result is delivered via [`gui::call`].
     fn gui_call(&mut self, _key: String, _method: String, _params: String) {}
 }
@@ -623,6 +745,10 @@ impl wit::Guest for Component {
     }
 
     fn gui_init() {
+        // Subscribe to host workspace-change topics to keep our caches warm.
+        pub_sub::subscribe("zed.project-root-changed").ok();
+        pub_sub::subscribe("zed.active-file-changed").ok();
+        pub_sub::subscribe("zed.open-files-changed").ok();
         extension().gui_init();
     }
 
@@ -651,6 +777,19 @@ impl wit::Guest for Component {
 
     fn run_extension_command(command_id: String) -> Result<(), String> {
         extension().run_extension_command(&command_id)
+    }
+
+    fn on_pub_sub_event(event: wit::zed::extension::pub_sub::PubSubEvent) {
+        extension().on_pub_sub_event(event);
+    }
+
+    fn on_query(
+        query_id: u64,
+        topic: String,
+        source: String,
+        data: String,
+    ) -> Result<String, String> {
+        extension().on_query(query_id, topic, source, data)
     }
 }
 

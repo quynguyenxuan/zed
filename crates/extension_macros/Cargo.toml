@@ -1,0 +1,13 @@
+[package]
+name = "extension_macros"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+proc-macro = true
+path = "src/extension_macros.rs"
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

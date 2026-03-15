@@ -1,0 +1,20 @@
+id = "project-test"
+name = "Project Test"
+description = "A test extension that displays a file tree panel similar to the project panel."
+version = "0.1.0"
+schema_version = 1
+authors = ["Zed Dev <dev@zed.dev>"]
+repository = "https://github.com/zed-industries/zed"
+
+[panel_ui]
+min_zed_api = "0.9.0"
+
+[[capabilities]]
+kind = "process:exec"
+command = "find"
+args = ["**"]
+
+[[capabilities]]
+kind = "process:exec"
+command = "ls"
+args = ["**"]

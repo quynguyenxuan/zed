@@ -219,6 +219,14 @@ pub struct Open {
     pub create_new_window: bool,
 }
 
+/// Opens a file at the specified path.
+#[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = workspace)]
+pub struct OpenPath {
+    /// Absolute path to the file to open.
+    pub path: String,
+}
+
 impl Open {
     pub const DEFAULT: Self = Self {
         create_new_window: true,
@@ -717,6 +725,23 @@ pub fn prompt_for_open_path_and_open(
     .detach();
 }
 
+fn open_path_action(action: &OpenPath, cx: &mut App) {
+    use std::path::PathBuf;
+    let path = PathBuf::from(&action.path);
+    if let Some(workspace_window) = local_workspace_windows(cx).into_iter().next() {
+        workspace_window
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                workspace.update(cx, |workspace, cx| {
+                    workspace
+                        .open_abs_path(path, OpenOptions::default(), window, cx)
+                        .detach_and_log_err(cx);
+                });
+            })
+            .ok();
+    }
+}
+
 pub fn init(app_state: Arc<AppState>, cx: &mut App) {
     component::init();
     theme_preview::init(cx);
@@ -759,7 +784,10 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
                     );
                 }
             }
-        });
+        })
+        .on_action(
+            |action: &OpenPath, cx: &mut App| open_path_action(action, cx),
+        );
 }
 
 type BuildProjectItemFn =

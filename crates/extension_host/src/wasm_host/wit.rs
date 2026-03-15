@@ -1514,6 +1514,33 @@ impl Extension {
             _ => Ok(Ok(())),
         }
     }
+
+    pub async fn call_on_pub_sub_event(
+        &self,
+        store: &mut Store<WasmState>,
+        event: &since_v0_9_0::pub_sub::PubSubEvent,
+    ) -> Result<()> {
+        match self {
+            Extension::V0_9_0(ext) => ext.call_on_pub_sub_event(store, event).await,
+            _ => Ok(()),
+        }
+    }
+
+    pub async fn call_on_query(
+        &self,
+        store: &mut Store<WasmState>,
+        query_id: u64,
+        topic: &str,
+        source: &str,
+        data: &str,
+    ) -> Result<Result<String, String>> {
+        match self {
+            Extension::V0_9_0(ext) => {
+                ext.call_on_query(store, query_id, topic, source, data).await
+            }
+            _ => Ok(Ok(String::new())),
+        }
+    }
 }
 
 trait ToWasmtimeResult<T> {

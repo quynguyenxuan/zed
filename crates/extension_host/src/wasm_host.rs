@@ -530,22 +530,240 @@ pub struct WasmState {
     ctx: wasi::WasiCtx,
     pub host: Arc<WasmHost>,
     pub(crate) capability_granter: CapabilityGranter,
-    pub(crate) gui_panel_tx: Option<mpsc::UnboundedSender<GuiPanelMessage>>,
+    pub(crate) gui_panel_tx: Option<std::sync::mpsc::Sender<GuiPanelMessage>>,
+    pub(crate) command_execution_tx: Option<mpsc::UnboundedSender<CommandExecutionRequest>>,
+    pub(crate) pub_sub_event_tx: Option<mpsc::UnboundedSender<PubSubEvent>>,
+    pub(crate) query_tx: Option<mpsc::UnboundedSender<QueryDelivery>>,
     pub(crate) next_focus_handle_id: u32,
 }
 
 pub enum GuiPanelMessage {
-    SetView(String),
-    SetViewTree(wit::since_v0_9_0::ui_elements::UiTree),
     RequestFocus(u32),
     Emit { name: String, data: String },
     RequestData(String),
     Call { key: String, method: String, params: String },
 }
 
+pub enum CommandExecutionRequest {
+    ExecuteCommand {
+        command: String,
+        args: Option<String>,
+        response_tx: oneshot::Sender<Result<String, String>>,
+    },
+    ExecuteSlashCommand {
+        command: String,
+        args: Vec<String>,
+        response_tx: oneshot::Sender<Result<String, String>>,
+    },
+    PubSubSubscribe {
+        topic: String,
+        source_extension_id: Arc<str>,
+        event_tx: mpsc::UnboundedSender<PubSubEvent>,
+        response_tx: oneshot::Sender<Result<u64, String>>,
+    },
+    PubSubUnsubscribe {
+        subscription_id: u64,
+        response_tx: oneshot::Sender<Result<(), String>>,
+    },
+    PubSubPublish {
+        topic: String,
+        source_extension_id: Arc<str>,
+        data: String,
+        response_tx: oneshot::Sender<Result<(), String>>,
+    },
+    QueryRegisterHandler {
+        topic: String,
+        source_extension_id: Arc<str>,
+        query_tx: mpsc::UnboundedSender<QueryDelivery>,
+        response_tx: oneshot::Sender<Result<u64, String>>,
+    },
+    QueryUnregisterHandler {
+        handler_id: u64,
+        response_tx: oneshot::Sender<Result<(), String>>,
+    },
+    QueryRequest {
+        topic: String,
+        source_extension_id: Arc<str>,
+        data: String,
+        timeout_ms: u32,
+        response_tx: oneshot::Sender<Result<Vec<QueryResponse>, String>>,
+    },
+}
+
+pub struct QueryDelivery {
+    pub query_id: u64,
+    pub topic: String,
+    pub source: String,
+    pub data: String,
+    pub response_tx: oneshot::Sender<Result<String, String>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct QueryResponse {
+    pub source: String,
+    pub data: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PubSubEvent {
+    pub topic: String,
+    pub source: String,
+    pub data: String,
+}
+
+pub struct ExtensionEventBus {
+    next_id: u64,
+    subscriptions: std::collections::HashMap<u64, ExtensionSubscription>,
+    topic_index: std::collections::HashMap<String, Vec<u64>>,
+    next_query_handler_id: u64,
+    query_handlers: std::collections::HashMap<u64, QueryHandlerEntry>,
+    query_handler_index: std::collections::HashMap<String, Vec<u64>>,
+}
+
+struct ExtensionSubscription {
+    topic: String,
+    sender: mpsc::UnboundedSender<PubSubEvent>,
+}
+
+struct QueryHandlerEntry {
+    extension_id: Arc<str>,
+    topic: String,
+    sender: mpsc::UnboundedSender<QueryDelivery>,
+}
+
+impl ExtensionEventBus {
+    pub fn new() -> Self {
+        Self {
+            next_id: 0,
+            subscriptions: std::collections::HashMap::new(),
+            topic_index: std::collections::HashMap::new(),
+            next_query_handler_id: 0,
+            query_handlers: std::collections::HashMap::new(),
+            query_handler_index: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn subscribe(
+        &mut self,
+        topic: String,
+        sender: mpsc::UnboundedSender<PubSubEvent>,
+    ) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        self.topic_index.entry(topic.clone()).or_default().push(id);
+        self.subscriptions.insert(id, ExtensionSubscription { topic, sender });
+        id
+    }
+
+    pub fn unsubscribe(&mut self, subscription_id: u64) -> Result<(), String> {
+        let sub = self
+            .subscriptions
+            .remove(&subscription_id)
+            .ok_or_else(|| "Subscription not found".to_string())?;
+        if let Some(ids) = self.topic_index.get_mut(&sub.topic) {
+            ids.retain(|id| *id != subscription_id);
+            if ids.is_empty() {
+                self.topic_index.remove(&sub.topic);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn publish(&mut self, topic: &str, source: String, data: String) {
+        let Some(ids) = self.topic_index.get(topic) else {
+            return;
+        };
+        let ids = ids.clone();
+        let event = PubSubEvent { topic: topic.to_string(), source, data };
+        let mut dead = Vec::new();
+        for id in ids {
+            if let Some(sub) = self.subscriptions.get(&id) {
+                if sub.sender.unbounded_send(event.clone()).is_err() {
+                    dead.push(id);
+                }
+            }
+        }
+        for id in dead {
+            self.unsubscribe(id).ok();
+        }
+    }
+
+    pub fn register_query_handler(
+        &mut self,
+        topic: String,
+        extension_id: Arc<str>,
+        sender: mpsc::UnboundedSender<QueryDelivery>,
+    ) -> u64 {
+        let id = self.next_query_handler_id;
+        self.next_query_handler_id = self.next_query_handler_id.saturating_add(1);
+        self.query_handler_index.entry(topic.clone()).or_default().push(id);
+        self.query_handlers.insert(id, QueryHandlerEntry { extension_id, topic, sender });
+        id
+    }
+
+    pub fn unregister_query_handler(&mut self, handler_id: u64) -> Result<(), String> {
+        let entry = self
+            .query_handlers
+            .remove(&handler_id)
+            .ok_or_else(|| "Query handler not found".to_string())?;
+        if let Some(ids) = self.query_handler_index.get_mut(&entry.topic) {
+            ids.retain(|id| *id != handler_id);
+            if ids.is_empty() {
+                self.query_handler_index.remove(&entry.topic);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get_query_handlers(
+        &mut self,
+        topic: &str,
+    ) -> Vec<(Arc<str>, mpsc::UnboundedSender<QueryDelivery>)> {
+        let Some(ids) = self.query_handler_index.get(topic) else {
+            return vec![];
+        };
+        let ids = ids.clone();
+        let mut result = Vec::new();
+        let mut dead = Vec::new();
+        for id in ids {
+            if let Some(entry) = self.query_handlers.get(&id) {
+                if entry.sender.is_closed() {
+                    dead.push(id);
+                } else {
+                    result.push((entry.extension_id.clone(), entry.sender.clone()));
+                }
+            }
+        }
+        for id in dead {
+            self.unregister_query_handler(id).ok();
+        }
+        result
+    }
+}
+
+impl Default for ExtensionEventBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl gpui::Global for ExtensionEventBus {}
+
 impl WasmState {
-    pub fn set_gui_panel_tx(&mut self, tx: mpsc::UnboundedSender<GuiPanelMessage>) {
+    pub fn set_gui_panel_tx(&mut self, tx: std::sync::mpsc::Sender<GuiPanelMessage>) {
         self.gui_panel_tx = Some(tx);
+    }
+
+    pub fn set_command_execution_tx(&mut self, tx: mpsc::UnboundedSender<CommandExecutionRequest>) {
+        self.command_execution_tx = Some(tx);
+    }
+
+    pub fn set_pub_sub_event_tx(&mut self, tx: mpsc::UnboundedSender<PubSubEvent>) {
+        self.pub_sub_event_tx = Some(tx);
+    }
+
+    pub fn set_query_tx(&mut self, tx: mpsc::UnboundedSender<QueryDelivery>) {
+        self.query_tx = Some(tx);
     }
 }
 
@@ -683,6 +901,9 @@ impl WasmHost {
                         manifest.clone(),
                     ),
                     gui_panel_tx: None,
+                    command_execution_tx: None,
+                    pub_sub_event_tx: None,
+                    query_tx: None,
                     next_focus_handle_id: 0,
                 },
             );
@@ -919,7 +1140,7 @@ impl WasmExtension {
 
     pub async fn inject_gui_panel_tx(
         &self,
-        tx: mpsc::UnboundedSender<GuiPanelMessage>,
+        tx: std::sync::mpsc::Sender<GuiPanelMessage>,
     ) -> Result<()> {
         self.call(move |_ext, store| {
             Box::pin(async move {
@@ -928,6 +1149,19 @@ impl WasmExtension {
         })
         .await
     }
+
+    pub async fn inject_command_execution_tx(
+        &self,
+        tx: mpsc::UnboundedSender<CommandExecutionRequest>,
+    ) -> Result<()> {
+        self.call(move |_ext, store| {
+            Box::pin(async move {
+                store.data_mut().set_command_execution_tx(tx);
+            })
+        })
+        .await
+    }
+
 
     pub async fn call_gui_init(&self) -> Result<()> {
         self.call(|ext, store| {
@@ -978,6 +1212,54 @@ impl WasmExtension {
     ) -> Result<wit::since_v0_9_0::ui_elements::UiTree> {
         self.call(move |ext, store| {
             async move { ext.call_gui_render_list_item(store, &list_id, index).await }.boxed()
+        })
+        .await?
+    }
+
+    pub async fn inject_pub_sub_event_tx(
+        &self,
+        tx: mpsc::UnboundedSender<PubSubEvent>,
+    ) -> Result<()> {
+        self.call(move |_ext, store| {
+            Box::pin(async move {
+                store.data_mut().set_pub_sub_event_tx(tx);
+            })
+        })
+        .await
+    }
+
+    pub async fn call_on_pub_sub_event(
+        &self,
+        event: wit::since_v0_9_0::pub_sub::PubSubEvent,
+    ) -> Result<()> {
+        self.call(move |ext, store| {
+            async move { ext.call_on_pub_sub_event(store, &event).await }.boxed()
+        })
+        .await?
+    }
+
+    pub async fn inject_query_tx(
+        &self,
+        tx: mpsc::UnboundedSender<QueryDelivery>,
+    ) -> Result<()> {
+        self.call(move |_ext, store| {
+            Box::pin(async move {
+                store.data_mut().set_query_tx(tx);
+            })
+        })
+        .await
+    }
+
+    pub async fn call_on_query(
+        &self,
+        query_id: u64,
+        topic: String,
+        source: String,
+        data: String,
+    ) -> Result<Result<String, String>> {
+        self.call(move |ext, store| {
+            async move { ext.call_on_query(store, query_id, &topic, &source, &data).await }
+                .boxed()
         })
         .await?
     }

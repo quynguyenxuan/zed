@@ -99,16 +99,6 @@ interface gui {
 
     // ── Host functions (provided by Zed, called by WASM) ─────────────────
 
-    /// Updates the panel UI using a JSON-encoded element tree (legacy).
-    /// Prefer set-view-tree for new extensions.
-    set-view: func(view-json: string);
-
-    /// Replaces the extension panel's element tree with a structured WIT tree.
-    /// The host renders the tree using native GPUI elements.
-    /// Calling this is optional — the host also calls gui-render after each
-    /// event to pull the latest tree from the extension.
-    set-view-tree: func(tree: ui-tree);
-
     /// Creates a focus handle managed by the host. Returns an opaque integer
     /// ID. Pass it in div-node.focus-handle-id to make that element focusable.
     create-focus-handle: func() -> u32;
@@ -129,4 +119,6 @@ interface gui {
     /// The result is delivered via gui-on-data(key, result-json).
     /// Returns an error immediately if the method name is not in the allowed set.
     call: func(key: string, method: string, params: string) -> result<_, string>;
+
+
 }

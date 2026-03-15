@@ -25,6 +25,7 @@ cloud_api_types.workspace = true
 collections.workspace = true
 dap.workspace = true
 extension.workspace = true
+extension_macros.workspace = true
 fs.workspace = true
 futures.workspace = true
 gpui.workspace = true

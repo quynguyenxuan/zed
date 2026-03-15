@@ -1,20 +1,19 @@
 //! Virtual element builders for extension GUI panels.
 //!
-//! These types mirror GPUI's element API. Call [`render_tree`] (or the
-//! convenience wrapper [`set_view_tree`]) to serialize the tree across the WIT
-//! boundary so Zed can render it with native GPUI elements.
+//! These types mirror GPUI's element API. Call [`render_tree`] to serialize
+//! the tree across the WIT boundary so Zed can render it with native GPUI elements.
 //!
 //! # Quick start
 //!
 //! ```rust,no_run
 //! use zed_extension_api::ui::*;
 //!
-//! fn my_render(label: &str) {
+//! fn gui_render(&mut self) -> zed::ui_elements::UiTree {
 //!     clear_handlers();
 //!     let tree = v_flex()
 //!         .p_4()
 //!         .gap_2()
-//!         .child(Label::new(label))
+//!         .child(Label::new("Hello"))
 //!         .child(
 //!             div()
 //!                 .id("btn")
@@ -26,7 +25,7 @@
 //!                 .on_click(|_| { /* handle click */ })
 //!                 .child(Label::new("Click me")),
 //!         );
-//!     set_view_tree(tree);
+//!     render_tree(tree)
 //! }
 //! ```
 
@@ -367,13 +366,6 @@ pub fn render_tree(root: Div) -> UiTree {
     let mut nodes: Vec<UiNode> = Vec::new();
     let root_idx = flatten_node(&mut nodes, AnyNode::Div(root));
     UiTree { nodes, root: root_idx }
-}
-
-/// Serialize the tree and send it to the host panel immediately.
-/// Equivalent to calling `gui::set_view_tree(render_tree(root))`.
-pub fn set_view_tree(root: Div) {
-    let tree = render_tree(root);
-    gui::set_view_tree(&tree);
 }
 
 fn flatten_node(nodes: &mut Vec<UiNode>, node: AnyNode) -> u32 {
@@ -1149,6 +1141,91 @@ impl IntoAnyNode for UniformList {
             self.style,
             self.fill_width,
         )
+    }
+}
+
+// ── Input ──────────────────────────────────────────────────────────────────
+
+/// A text input field.
+pub struct Input {
+    id: String,
+    value: String,
+    placeholder: Option<String>,
+    disabled: bool,
+    style: Style,
+}
+
+impl Input {
+    pub fn new(id: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            value: value.into(),
+            placeholder: None,
+            disabled: false,
+            style: empty_style(),
+        }
+    }
+
+    pub fn placeholder(mut self, text: impl Into<String>) -> Self {
+        self.placeholder = Some(text.into());
+        self
+    }
+
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    pub fn on_input(self, f: impl Fn(&str) + 'static) -> Self {
+        register_handler(&self.id, UiHandler::InputChanged(Box::new(f)));
+        self
+    }
+
+    // Style methods
+    pub fn w_full(mut self) -> Self {
+        self.style.width = Some(Length::Relative(1.0));
+        self
+    }
+    pub fn px(mut self, v: Length) -> Self {
+        let current = self.style.padding.take().unwrap_or_else(|| edges_all(Length::Px(0.0)));
+        self.style.padding = Some(EdgesLength { left: v, right: v, ..current });
+        self
+    }
+    pub fn py(mut self, v: Length) -> Self {
+        let current = self.style.padding.take().unwrap_or_else(|| edges_all(Length::Px(0.0)));
+        self.style.padding = Some(EdgesLength { top: v, bottom: v, ..current });
+        self
+    }
+    pub fn p_2(self) -> Self {
+        let mut s = self;
+        s.style.padding = Some(edges_all(Length::Rems(0.5)));
+        s
+    }
+    pub fn rounded_md(mut self) -> Self {
+        self.style.corner_radii = Some(corners_all(AbsoluteLength::Px(6.0)));
+        self
+    }
+    pub fn border_1(mut self) -> Self {
+        self.style.border_widths = Some(abs_edges_all(AbsoluteLength::Px(1.0)));
+        self
+    }
+    pub fn border_color(mut self, color: Color) -> Self {
+        self.style.border_color = Some(color);
+        self
+    }
+    pub fn bg(mut self, color: Color) -> Self {
+        self.style.background = Some(Background::Color(color));
+        self
+    }
+    pub fn text_sm(mut self) -> Self {
+        self.style.text_size = Some(AbsoluteLength::Rems(0.875));
+        self
+    }
+}
+
+impl IntoAnyNode for Input {
+    fn into_any_node(self) -> AnyNode {
+        AnyNode::Input(self.id, self.value, self.placeholder, self.disabled, self.style)
     }
 }
 

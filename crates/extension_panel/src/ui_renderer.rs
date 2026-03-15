@@ -1,11 +1,16 @@
 use extension_host::wasm_host::wit;
 use gpui::{
     AbsoluteLength, AlignContent, AlignItems, AnyElement, App, ClickEvent, Corners, CursorStyle,
-    DefiniteLength, Display, Edges, ElementId, Fill, FlexDirection, FlexWrap, FontStyle,
+    DefiniteLength, Display, Edges, ElementId, Fill, FlexDirection, FlexWrap, FocusHandle, FontStyle,
     FontWeight, Hsla, IntoElement, Length, Overflow, Position, SharedString,
     Visibility, Window, div, hsla, px, rems, prelude::*,
 };
+use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::{Arc, Mutex};
 use theme::ActiveTheme as _;
+use ui;
+use unicode_segmentation::UnicodeSegmentation;
 
 type WitUiTree = wit::since_v0_9_0::ui_elements::UiTree;
 type WitUiNode = wit::since_v0_9_0::ui_elements::UiNode;
@@ -21,39 +26,109 @@ type WitCornersAbsolute = wit::since_v0_9_0::ui_elements::CornersAbsolute;
 type WitDivNode = wit::since_v0_9_0::ui_elements::DivNode;
 type WitTextNode = wit::since_v0_9_0::ui_elements::TextNode;
 type WitInputNode = wit::since_v0_9_0::ui_elements::InputNode;
+type WitSvgNode = wit::since_v0_9_0::ui_elements::SvgNode;
+type WitImgNode = wit::since_v0_9_0::ui_elements::ImgNode;
+type WitIconSource = wit::since_v0_9_0::ui_elements::IconSource;
 pub type WitUiEvent = wit::since_v0_9_0::gui::UiEvent;
 type WitMouseEventData = wit::since_v0_9_0::gui::MouseEventData;
+
+// ── Input Selection State ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct InputState {
+    selected_range: Range<usize>,
+    selection_reversed: bool,
+}
+
+impl Default for InputState {
+    fn default() -> Self {
+        Self {
+            selected_range: 0..0,
+            selection_reversed: false,
+        }
+    }
+}
+
+fn input_states() -> &'static Mutex<HashMap<String, InputState>> {
+    static INPUT_STATES: std::sync::OnceLock<Mutex<HashMap<String, InputState>>> =
+        std::sync::OnceLock::new();
+    INPUT_STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn get_input_state(input_id: &str) -> InputState {
+    input_states()
+        .lock()
+        .unwrap()
+        .get(input_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn set_input_state(input_id: String, state: InputState) {
+    input_states().lock().unwrap().insert(input_id, state);
+}
+
+fn cursor_offset(state: &InputState) -> usize {
+    if state.selection_reversed {
+        state.selected_range.start
+    } else {
+        state.selected_range.end
+    }
+}
+
+fn previous_boundary(content: &str, offset: usize) -> usize {
+    content
+        .grapheme_indices(true)
+        .rev()
+        .find_map(|(idx, _)| (idx < offset).then_some(idx))
+        .unwrap_or(0)
+}
+
+fn next_boundary(content: &str, offset: usize) -> usize {
+    content
+        .grapheme_indices(true)
+        .find_map(|(idx, _)| (idx > offset).then_some(idx))
+        .unwrap_or(content.len())
+}
+
+// ── UI Tree Rendering ──────────────────────────────────────────────────────
 
 /// Converts a flat `WitUiTree` into a GPUI element hierarchy.
 ///
 /// `on_event(source_id, event, window, cx)` is called when the user interacts
 /// with any interactive element. The caller is responsible for forwarding the
 /// event to the extension and re-rendering.
+///
+/// `focus_handles` maps WIT focus handle IDs to GPUI FocusHandles.
 pub fn render_ui_tree(
     tree: &WitUiTree,
     on_event: impl Fn(String, WitUiEvent, &mut Window, &mut App) + Clone + 'static,
+    focus_handles: Arc<Mutex<std::collections::HashMap<u32, FocusHandle>>>,
+    window: &mut Window,
     cx: &App,
 ) -> AnyElement {
     if tree.nodes.is_empty() {
         return div().into_any_element();
     }
-    render_node(&tree.nodes, tree.root, &on_event, cx)
+    render_node(&tree.nodes, tree.root, &on_event, &focus_handles, window, cx)
 }
 
 fn render_node(
     nodes: &[WitUiNode],
     idx: u32,
     on_event: &(impl Fn(String, WitUiEvent, &mut Window, &mut App) + Clone + 'static),
+    focus_handles: &Arc<Mutex<std::collections::HashMap<u32, FocusHandle>>>,
+    window: &mut Window,
     cx: &App,
 ) -> AnyElement {
     match nodes.get(idx as usize) {
         None => div().into_any_element(),
-        Some(WitUiNode::Div(n)) => render_div(nodes, n, idx, on_event, cx),
+        Some(WitUiNode::Div(n)) => render_div(nodes, n, idx, on_event, focus_handles, window, cx),
         Some(WitUiNode::Text(n)) => render_text(n, cx),
-        Some(WitUiNode::Svg(_)) => div().into_any_element(),
-        Some(WitUiNode::Img(_)) => div().into_any_element(),
-        Some(WitUiNode::Input(n)) => render_input(n, cx),
-        Some(WitUiNode::UniformList(_)) => div().into_any_element(),
+        Some(WitUiNode::Svg(n)) => render_svg(n, cx),
+        Some(WitUiNode::Img(n)) => render_img(n, on_event, cx),
+        Some(WitUiNode::Input(n)) => render_input(n, on_event, cx),
+        Some(WitUiNode::UniformList(n)) => render_uniform_list(n, on_event, focus_handles, window, cx),
     }
 }
 
@@ -62,6 +137,8 @@ fn render_div(
     n: &WitDivNode,
     node_idx: u32,
     on_event: &(impl Fn(String, WitUiEvent, &mut Window, &mut App) + Clone + 'static),
+    focus_handles: &Arc<Mutex<std::collections::HashMap<u32, FocusHandle>>>,
+    window: &mut Window,
     cx: &App,
 ) -> AnyElement {
     let element_id = n
@@ -74,16 +151,44 @@ fn render_div(
     apply_style(&mut element, &n.style, cx);
 
     for &child_idx in &n.children {
-        element = element.child(render_node(nodes, child_idx, on_event, cx));
+        element = element.child(render_node(nodes, child_idx, on_event, focus_handles, window, cx));
     }
 
-    if n.events.on_click {
+    // Handle click and double-click with the same handler
+    if n.events.on_click || n.events.on_double_click {
         let source_id = n.id.clone().unwrap_or_default();
         let cb = on_event.clone();
+        let handle_double = n.events.on_double_click;
+        let handle_single = n.events.on_click;
         element = element.on_click(move |click, window, cx| {
+            let mouse_data = mouse_data_from_click(click);
+            // Check click count for double-click
+            if handle_double && mouse_data.click_count >= 2 {
+                cb(
+                    source_id.clone(),
+                    WitUiEvent::DoubleClicked(mouse_data),
+                    window,
+                    cx,
+                );
+            } else if handle_single {
+                cb(
+                    source_id.clone(),
+                    WitUiEvent::Clicked(mouse_data),
+                    window,
+                    cx,
+                );
+            }
+        });
+    }
+
+    // Right-click uses on_aux_click
+    if n.events.on_right_click {
+        let source_id = n.id.clone().unwrap_or_default();
+        let cb = on_event.clone();
+        element = element.on_aux_click(move |click, window, cx| {
             cb(
                 source_id.clone(),
-                WitUiEvent::Clicked(mouse_data_from_click(click)),
+                WitUiEvent::RightClicked(mouse_data_from_click(click)),
                 window,
                 cx,
             );
@@ -103,6 +208,187 @@ fn render_div(
         });
     }
 
+    if n.events.on_mouse_down {
+        let source_id = n.id.clone().unwrap_or_default();
+        let cb = on_event.clone();
+        element = element.on_mouse_down(gpui::MouseButton::Left, move |event, window, cx| {
+            cb(
+                source_id.clone(),
+                WitUiEvent::MouseDown(WitMouseEventData {
+                    x: f32::from(event.position.x),
+                    y: f32::from(event.position.y),
+                    button: 0,
+                    click_count: 0,
+                    shift: event.modifiers.shift,
+                    ctrl: event.modifiers.control,
+                    alt: event.modifiers.alt,
+                    meta: event.modifiers.platform,
+                }),
+                window,
+                cx,
+            );
+        });
+    }
+
+    if n.events.on_mouse_up {
+        let source_id = n.id.clone().unwrap_or_default();
+        let cb = on_event.clone();
+        element = element.on_mouse_up(gpui::MouseButton::Left, move |event, window, cx| {
+            cb(
+                source_id.clone(),
+                WitUiEvent::MouseUp(WitMouseEventData {
+                    x: f32::from(event.position.x),
+                    y: f32::from(event.position.y),
+                    button: 0,
+                    click_count: 0,
+                    shift: event.modifiers.shift,
+                    ctrl: event.modifiers.control,
+                    alt: event.modifiers.alt,
+                    meta: event.modifiers.platform,
+                }),
+                window,
+                cx,
+            );
+        });
+    }
+
+    if n.events.on_mouse_move {
+        let source_id = n.id.clone().unwrap_or_default();
+        let cb = on_event.clone();
+        element = element.on_mouse_move(move |event, window, cx| {
+            cb(
+                source_id.clone(),
+                WitUiEvent::MouseMoved(WitMouseEventData {
+                    x: f32::from(event.position.x),
+                    y: f32::from(event.position.y),
+                    button: 0,
+                    click_count: 0,
+                    shift: event.modifiers.shift,
+                    ctrl: event.modifiers.control,
+                    alt: event.modifiers.alt,
+                    meta: event.modifiers.platform,
+                }),
+                window,
+                cx,
+            );
+        });
+    }
+
+    if n.events.on_scroll_wheel {
+        let source_id = n.id.clone().unwrap_or_default();
+        let cb = on_event.clone();
+        element = element.on_scroll_wheel(move |event, window, cx| {
+            let pixel_delta = event.delta.pixel_delta(window.line_height());
+            cb(
+                source_id.clone(),
+                WitUiEvent::ScrollWheel(wit::since_v0_9_0::gui::ScrollEventData {
+                    delta_x: f32::from(pixel_delta.x),
+                    delta_y: f32::from(pixel_delta.y),
+                    precise: event.delta.precise(),
+                }),
+                window,
+                cx,
+            );
+        });
+    }
+
+    if n.events.on_key_down {
+        let source_id = n.id.clone().unwrap_or_default();
+        let cb = on_event.clone();
+        element = element.on_key_down(move |event, window, cx| {
+            cb(
+                source_id.clone(),
+                WitUiEvent::KeyDown(wit::since_v0_9_0::gui::KeyEventData {
+                    key: event.keystroke.key.clone(),
+                    shift: event.keystroke.modifiers.shift,
+                    ctrl: event.keystroke.modifiers.control,
+                    alt: event.keystroke.modifiers.alt,
+                    meta: event.keystroke.modifiers.platform,
+                    repeat: false, // GPUI doesn't expose repeat in KeyDownEvent
+                }),
+                window,
+                cx,
+            );
+        });
+    }
+
+    if n.events.on_key_up {
+        let source_id = n.id.clone().unwrap_or_default();
+        let cb = on_event.clone();
+        element = element.on_key_up(move |event, window, cx| {
+            cb(
+                source_id.clone(),
+                WitUiEvent::KeyUp(wit::since_v0_9_0::gui::KeyEventData {
+                    key: event.keystroke.key.clone(),
+                    shift: event.keystroke.modifiers.shift,
+                    ctrl: event.keystroke.modifiers.control,
+                    alt: event.keystroke.modifiers.alt,
+                    meta: event.keystroke.modifiers.platform,
+                    repeat: false,
+                }),
+                window,
+                cx,
+            );
+        });
+    }
+
+    // Focus handle integration - use pre-created GPUI FocusHandle
+    if let Some(handle_id) = n.focus_handle_id {
+        // Get the pre-created FocusHandle for this element
+        let focus_handle = {
+            let handles = focus_handles.lock().unwrap();
+            handles.get(&handle_id).cloned()
+        };
+
+        if let Some(focus_handle) = focus_handle {
+            // Track focus with GPUI - this enables tab navigation and focus styling
+            element = element.track_focus(&focus_handle);
+
+            // Note: GPUI doesn't have on_focus_in/on_focus_out element methods.
+            // Focus events need to be subscribed via cx.on_focus_in/cx.on_focus_out
+            // which requires a Context, not available during render.
+            // The extension can detect focus changes by checking is_focused() on key events
+            // or we need to subscribe in ExtensionGuiView::new() and emit events there.
+            // For now, we mark the element focusable via track_focus which enables:
+            // - Tab navigation between focusable elements
+            // - Focus styling (can use .focus() style modifier)
+            // - Focus checking in key event handlers
+        }
+    }
+
+    // Drag events - notify drag started (full drag preview needs complex setup)
+    if n.events.on_drag {
+        let source_id = n.id.clone().unwrap_or_default();
+        let cb = on_event.clone();
+        // Send DragStarted event on mouse down
+        // Full drag-and-drop with preview would require Entity<W> constructor
+        // which is too complex for WIT boundary - extensions can handle drag manually
+        if !n.events.on_mouse_down {
+            element = element.on_mouse_down(gpui::MouseButton::Left, move |_event, window, cx| {
+                cb(
+                    source_id.clone(),
+                    WitUiEvent::DragStarted,
+                    window,
+                    cx,
+                );
+            });
+        }
+    }
+
+    // Drop events
+    if n.events.on_drop {
+        let source_id = n.id.clone().unwrap_or_default();
+        let cb = on_event.clone();
+        element = element.on_drop(move |data: &String, window, cx| {
+            cb(
+                source_id.clone(),
+                WitUiEvent::Dropped(data.clone()),
+                window,
+                cx,
+            );
+        });
+    }
+
     if let Some(tooltip_text) = n.tooltip.clone() {
         element = element.tooltip(ui::Tooltip::text(tooltip_text));
     }
@@ -118,16 +404,307 @@ fn render_text(n: &WitTextNode, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn render_input(n: &WitInputNode, cx: &App) -> AnyElement {
-    let mut element = div();
+fn render_input(
+    n: &WitInputNode,
+    on_event: &(impl Fn(String, WitUiEvent, &mut Window, &mut App) + Clone + 'static),
+    cx: &App,
+) -> AnyElement {
+    let input_id = n.id.clone();
+    let current_value = n.value.clone();
+    let state = get_input_state(&input_id);
+
+    let mut element = div()
+        .id(ElementId::Name(input_id.clone().into()))
+        .cursor(CursorStyle::IBeam)
+        .relative()
+        .flex()
+        .items_center();
+
     apply_style(&mut element, &n.style, cx);
-    let display_text = if n.value.is_empty() {
+
+    let display_text = if current_value.is_empty() {
         n.placeholder.clone().unwrap_or_default()
     } else {
-        n.value.clone()
+        current_value.clone()
     };
+
+    let is_empty = current_value.is_empty();
+    let text_color = if is_empty {
+        cx.theme().colors().text_placeholder
+    } else {
+        cx.theme().colors().text
+    };
+
+    let cb_for_click = on_event.clone();
+    let cb_for_keys = on_event.clone();
+    let input_id_for_click = input_id.clone();
+    let current_value_for_keys = current_value.clone();
+
+    element = element
+        .on_click(move |_, window, cx| {
+            cb_for_click(input_id_for_click.clone(), WitUiEvent::FocusGained, window, cx);
+        })
+        .on_key_down(move |event, window, cx| {
+            let mut state = get_input_state(&input_id);
+            let mut new_value = current_value_for_keys.clone();
+            let shift = event.keystroke.modifiers.shift;
+            let ctrl_or_cmd = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+
+            match event.keystroke.key.as_str() {
+                "backspace" => {
+                    if !state.selected_range.is_empty() {
+                        new_value.replace_range(state.selected_range.clone(), "");
+                        let cursor_pos = state.selected_range.start;
+                        state.selected_range = cursor_pos..cursor_pos;
+                        state.selection_reversed = false;
+                    } else if cursor_offset(&state) > 0 {
+                        let prev = previous_boundary(&new_value, cursor_offset(&state));
+                        new_value.replace_range(prev..cursor_offset(&state), "");
+                        state.selected_range = prev..prev;
+                        state.selection_reversed = false;
+                    }
+                    set_input_state(input_id.clone(), state);
+                    cb_for_keys(input_id.clone(), WitUiEvent::InputChanged(new_value), window, cx);
+                }
+                "delete" => {
+                    if !state.selected_range.is_empty() {
+                        new_value.replace_range(state.selected_range.clone(), "");
+                        let cursor_pos = state.selected_range.start;
+                        state.selected_range = cursor_pos..cursor_pos;
+                        state.selection_reversed = false;
+                    } else if cursor_offset(&state) < new_value.len() {
+                        let next = next_boundary(&new_value, cursor_offset(&state));
+                        new_value.replace_range(cursor_offset(&state)..next, "");
+                    }
+                    set_input_state(input_id.clone(), state);
+                    cb_for_keys(input_id.clone(), WitUiEvent::InputChanged(new_value), window, cx);
+                }
+                "left" => {
+                    if shift {
+                        let new_pos = previous_boundary(&new_value, cursor_offset(&state));
+                        if state.selection_reversed {
+                            state.selected_range.start = new_pos;
+                        } else {
+                            state.selected_range.end = new_pos;
+                        }
+                        if state.selected_range.end < state.selected_range.start {
+                            state.selection_reversed = !state.selection_reversed;
+                            state.selected_range = state.selected_range.end..state.selected_range.start;
+                        }
+                    } else {
+                        let new_pos = if state.selected_range.is_empty() {
+                            previous_boundary(&new_value, cursor_offset(&state))
+                        } else {
+                            state.selected_range.start
+                        };
+                        state.selected_range = new_pos..new_pos;
+                        state.selection_reversed = false;
+                    }
+                    set_input_state(input_id.clone(), state);
+                }
+                "right" => {
+                    if shift {
+                        let new_pos = next_boundary(&new_value, cursor_offset(&state));
+                        if state.selection_reversed {
+                            state.selected_range.start = new_pos;
+                        } else {
+                            state.selected_range.end = new_pos;
+                        }
+                        if state.selected_range.end < state.selected_range.start {
+                            state.selection_reversed = !state.selection_reversed;
+                            state.selected_range = state.selected_range.end..state.selected_range.start;
+                        }
+                    } else {
+                        let new_pos = if state.selected_range.is_empty() {
+                            next_boundary(&new_value, cursor_offset(&state))
+                        } else {
+                            state.selected_range.end
+                        };
+                        state.selected_range = new_pos..new_pos;
+                        state.selection_reversed = false;
+                    }
+                    set_input_state(input_id.clone(), state);
+                }
+                "home" => {
+                    if shift {
+                        if state.selection_reversed {
+                            state.selected_range.start = 0;
+                        } else {
+                            state.selected_range.end = 0;
+                        }
+                        if state.selected_range.end < state.selected_range.start {
+                            state.selection_reversed = !state.selection_reversed;
+                            state.selected_range = state.selected_range.end..state.selected_range.start;
+                        }
+                    } else {
+                        state.selected_range = 0..0;
+                        state.selection_reversed = false;
+                    }
+                    set_input_state(input_id.clone(), state);
+                }
+                "end" => {
+                    let end_pos = new_value.len();
+                    if shift {
+                        if state.selection_reversed {
+                            state.selected_range.start = end_pos;
+                        } else {
+                            state.selected_range.end = end_pos;
+                        }
+                        if state.selected_range.end < state.selected_range.start {
+                            state.selection_reversed = !state.selection_reversed;
+                            state.selected_range = state.selected_range.end..state.selected_range.start;
+                        }
+                    } else {
+                        state.selected_range = end_pos..end_pos;
+                        state.selection_reversed = false;
+                    }
+                    set_input_state(input_id.clone(), state);
+                }
+                "a" if ctrl_or_cmd => {
+                    state.selected_range = 0..new_value.len();
+                    state.selection_reversed = false;
+                    set_input_state(input_id.clone(), state);
+                }
+                "enter" | "return" => {
+                    cb_for_keys(input_id.clone(), WitUiEvent::KeyDown(wit::since_v0_9_0::gui::KeyEventData {
+                        key: "enter".to_string(),
+                        shift: event.keystroke.modifiers.shift,
+                        ctrl: event.keystroke.modifiers.control,
+                        alt: event.keystroke.modifiers.alt,
+                        meta: event.keystroke.modifiers.platform,
+                        repeat: false,
+                    }), window, cx);
+                }
+                key if key.len() == 1 && !event.keystroke.modifiers.control && !event.keystroke.modifiers.platform => {
+                    if !state.selected_range.is_empty() {
+                        new_value.replace_range(state.selected_range.clone(), key);
+                        let cursor_pos = state.selected_range.start + key.len();
+                        state.selected_range = cursor_pos..cursor_pos;
+                        state.selection_reversed = false;
+                    } else {
+                        let cursor_pos = cursor_offset(&state);
+                        new_value.insert_str(cursor_pos, key);
+                        let new_cursor = cursor_pos + key.len();
+                        state.selected_range = new_cursor..new_cursor;
+                        state.selection_reversed = false;
+                    }
+                    set_input_state(input_id.clone(), state);
+                    cb_for_keys(input_id.clone(), WitUiEvent::InputChanged(new_value), window, cx);
+                }
+                _ => {}
+            }
+        });
+
+    // Render text with selection highlight
+    let has_selection = !state.selected_range.is_empty();
+
+    if has_selection && !is_empty {
+        let before_selection = &current_value[0..state.selected_range.start];
+        let selected_text = &current_value[state.selected_range.clone()];
+        let after_selection = &current_value[state.selected_range.end..];
+
+        element = element.child(
+            div()
+                .flex()
+                .items_center()
+                .when(!before_selection.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .text_color(text_color)
+                            .child(SharedString::from(before_selection.to_string()))
+                    )
+                })
+                .child(
+                    div()
+                        .bg(cx.theme().colors().element_selected)
+                        .text_color(text_color)
+                        .child(SharedString::from(selected_text.to_string()))
+                )
+                .when(!after_selection.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .text_color(text_color)
+                            .child(SharedString::from(after_selection.to_string()))
+                    )
+                })
+        );
+    } else {
+        element = element.child(
+            div()
+                .text_color(text_color)
+                .child(SharedString::from(display_text))
+        );
+
+        if !n.disabled && !has_selection {
+            element = element.child(
+                div()
+                    .w(px(2.0))
+                    .h_full()
+                    .bg(cx.theme().colors().text_accent)
+                    .ml(px(2.0))
+            );
+        }
+    }
+
+    element.into_any_element()
+}
+
+fn render_svg(n: &WitSvgNode, cx: &App) -> AnyElement {
+    let mut element = div();
+    apply_style(&mut element, &n.style, cx);
+
+    let icon = match &n.source {
+        WitIconSource::Named(name) => {
+            // Try to map to IconName, fallback to path
+            ui::Icon::from_path(format!("icons/{}.svg", name))
+        }
+        WitIconSource::Path(path) => {
+            ui::Icon::from_path(path.clone())
+        }
+    };
+
+    let icon = if let Some(hsla) = n.color.as_ref().and_then(|c| resolve_color(c, cx)) {
+        icon.color(ui::Color::Custom(hsla))
+    } else {
+        icon
+    };
+
+    element.child(icon).into_any_element()
+}
+
+fn render_img(n: &WitImgNode, on_event: &(impl Fn(String, WitUiEvent, &mut Window, &mut App) + Clone + 'static), cx: &App) -> AnyElement {
+    let element_id = n
+        .id
+        .as_ref()
+        .map(|s| ElementId::Name(s.clone().into()))
+        .unwrap_or(ElementId::Integer(0));
+
+    let mut element = div().id(element_id);
+    apply_style(&mut element, &n.style, cx);
+
+    // Handle image events
+    if n.events.on_click {
+        let source_id = n.id.clone().unwrap_or_default();
+        let cb = on_event.clone();
+        element = element.on_click(move |click, window, cx| {
+            cb(
+                source_id.clone(),
+                WitUiEvent::Clicked(mouse_data_from_click(click)),
+                window,
+                cx,
+            );
+        });
+    }
+
+    // Load image from path
+    use gpui::{img, ImageSource, Resource};
+    use std::path::Path;
+
+    let image_path = Arc::from(Path::new(&n.src));
+    let image_source = ImageSource::Resource(Resource::Path(image_path));
+
     element
-        .child(SharedString::from(display_text))
+        .child(img(image_source))
         .into_any_element()
 }
 
@@ -530,6 +1107,21 @@ fn resolve_background(bg: &WitBackground, cx: &App) -> Option<Hsla> {
     match bg {
         Background::Color(c) => resolve_color(c, cx),
     }
+}
+
+fn render_uniform_list(
+    n: &wit::since_v0_9_0::ui_elements::UniformListNode,
+    _on_event: &(impl Fn(String, WitUiEvent, &mut Window, &mut App) + Clone + 'static),
+    _focus_handles: &Arc<Mutex<std::collections::HashMap<u32, FocusHandle>>>,
+    _window: &mut Window,
+    _cx: &App,
+) -> AnyElement {
+    // UniformList rendering needs the WASM extension but we don't have it in this context
+    // For now, render a placeholder - proper implementation would need architecture changes
+    let _ = n;
+    div()
+        .child("UniformList not yet supported with focus handles")
+        .into_any_element()
 }
 
 fn mouse_data_from_click(click: &ClickEvent) -> WitMouseEventData {
