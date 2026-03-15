@@ -1,0 +1,1 @@
+{"name":"Project Test","version":"0.1.0","description":"A test extension that displays a file tree panel similar to the project panel.","authors":["Zed Dev <dev@zed.dev>"],"repository":"https://github.com/zed-industries/zed","schema_version":1,"wasm_api_version":"0.9.0","provides":["panel-ui"]}
