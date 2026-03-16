@@ -1,10 +1,13 @@
+mod event_handlers;
 mod ui_renderer;
+mod wit_types;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use command_palette_hooks::{DynamicCommand, GlobalDynamicCommandRegistry};
+use db::kvp::KEY_VALUE_STORE;
 use extension_host::{
     ExtensionManifest, ExtensionStore,
     wasm_host::{ExtensionEventBus, PubSubEvent, QueryDelivery, QueryResponse, WasmExtension, wit},
@@ -12,7 +15,7 @@ use extension_host::{
 use futures::StreamExt;
 use gpui::{
     Action, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, Pixels, Render, Rgba, SharedString, WeakEntity, Window, actions, px,
+    IntoElement, Pixels, Render, Rgba, SharedString, Task, WeakEntity, Window, actions, px,
 };
 use ui_input::{ErasedEditorEvent, InputField};
 use theme::ActiveTheme as _;
@@ -87,6 +90,16 @@ pub struct OpenExtensionPanel {
     pub command_id: String,
 }
 
+const EXTENSION_PANEL_KEY: &str = "ExtensionGuiPanel";
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct SerializedExtensionPanel {
+    /// List of extension IDs that were open, in tab order
+    open_extensions: Vec<String>,
+    /// Index of the active extension tab (if any)
+    active_index: Option<usize>,
+}
+
 /// Events emitted by extension GUI views to request workspace actions.
 #[derive(Clone, Debug)]
 pub enum ExtensionViewEvent {
@@ -97,7 +110,7 @@ pub enum ExtensionViewEvent {
 pub struct ExtensionGuiView {
     pub(crate) extension_id: Arc<str>,
     focus_handle: FocusHandle,
-    wasm: WasmExtension,
+    wasm: Arc<WasmExtension>,
     workspace: WeakEntity<Workspace>,
     ui_tree: Option<wit::since_v0_9_0::ui_elements::UiTree>,
     /// Maps WIT focus handle IDs to GPUI FocusHandles
@@ -117,6 +130,7 @@ impl ExtensionGuiView {
         workspace: WeakEntity<Workspace>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let wasm = Arc::new(wasm);
         // Create async channel for command execution requests
         let (cmd_tx, mut cmd_rx) = futures::channel::mpsc::unbounded();
 
@@ -330,7 +344,7 @@ impl ExtensionGuiView {
 
         // Subscribe to ext.open-file events and emit ExtensionViewEvent::OpenFile
         let (open_file_tx, open_file_rx) = futures::channel::mpsc::unbounded::<PubSubEvent>();
-        let open_file_subscription_id = cx.default_global::<ExtensionEventBus>()
+        let _open_file_subscription_id = cx.default_global::<ExtensionEventBus>()
             .subscribe("ext.open-file".to_string(), open_file_tx);
         cx.spawn(async move |this, cx| {
             let mut rx = open_file_rx;
@@ -371,7 +385,6 @@ impl ExtensionGuiView {
                 log::error!("inject_query_tx failed: {err}");
             }
 
-            log::info!("extension gui: calling gui_init");
             if let Err(err) = wasm_for_init.call_gui_init().await {
                 log::error!("gui_init failed: {err}");
             }
@@ -436,14 +449,8 @@ impl ExtensionGuiView {
                 wasm_for_init.call_on_pub_sub_event(evt).await.log_err();
             }
 
-            log::info!("extension gui: calling gui_render");
             match wasm_for_init.call_gui_render().await {
                 Ok(tree) => {
-                    log::info!(
-                        "extension gui: gui_render ok, nodes={}, root={}",
-                        tree.nodes.len(),
-                        tree.root
-                    );
                     this.update(cx, |view, cx| {
                         view.ui_tree = Some(tree);
                         cx.notify();
@@ -613,11 +620,12 @@ impl Render for ExtensionGuiView {
 
                 let focus_handles = self.focus_handles.clone();
                 let text_input_fields = &self.text_input_fields;
+                let wasm = self.wasm.clone();
 
                 div()
                     .track_focus(&self.focus_handle)
                     .size_full()
-                    .child(ui_renderer::render_ui_tree(tree, on_event, focus_handles, text_input_fields, window, cx))
+                    .child(ui_renderer::render_ui_tree(tree, on_event, focus_handles, text_input_fields, wasm, window, cx))
                     .into_any_element()
             }
             None => {
@@ -644,6 +652,9 @@ pub struct ExtensionGuiPanel {
     workspace: WeakEntity<Workspace>,
     width: Option<Pixels>,
     position: DockPosition,
+    pending_serialization: Task<Option<()>>,
+    /// Extensions to restore from serialized state (waiting for them to load)
+    pending_restore: Option<SerializedExtensionPanel>,
 }
 
 impl ExtensionGuiPanel {
@@ -651,11 +662,43 @@ impl ExtensionGuiPanel {
         workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
     ) -> Result<gpui::Entity<Self>> {
+        let serialized: Option<SerializedExtensionPanel> = KEY_VALUE_STORE
+            .read_kvp(EXTENSION_PANEL_KEY)?
+            .and_then(|s| serde_json::from_str(&s).ok());
+
         workspace.update_in(&mut cx, |workspace, window, cx| {
             let project = workspace.project().clone();
             let workspace_handle = workspace.weak_handle();
-            cx.new(|cx| Self::empty(workspace_handle, project, window, cx))
-        })
+            let panel = cx.new(|cx| Self::empty(workspace_handle, project, window, cx));
+
+            // Subscribe to pane events to trigger serialization
+            let pane = panel.read(cx).active_pane.clone();
+            let panel_weak = panel.downgrade();
+            cx.subscribe_in(
+                &pane,
+                window,
+                move |_workspace, _pane, event, _window, cx| match event {
+                    workspace::pane::Event::AddItem { .. }
+                    | workspace::pane::Event::RemovedItem { .. }
+                    | workspace::pane::Event::ActivateItem { .. } => {
+                        if let Some(panel) = panel_weak.upgrade() {
+                            panel.update(cx, |panel, cx| panel.serialize(cx));
+                        }
+                    }
+                    _ => {}
+                },
+            )
+            .detach();
+
+            // Store serialized state to restore later when extensions are loaded
+            if let Some(serialized) = serialized {
+                panel.update(cx, |panel, _cx| {
+                    panel.pending_restore = Some(serialized);
+                });
+            }
+
+            Ok(panel)
+        })?
     }
 
     pub fn empty(
@@ -671,7 +714,48 @@ impl ExtensionGuiPanel {
             workspace,
             width: None,
             position: DockPosition::Left,
+            pending_serialization: Task::ready(None),
+            pending_restore: None,
         }
+    }
+
+    fn serialize(&mut self, cx: &mut Context<Self>) {
+        let open_extensions: Vec<String> = self
+            .active_pane
+            .read(cx)
+            .items()
+            .filter_map(|item| {
+                item.downcast::<ExtensionGuiView>()
+                    .map(|view| view.read(cx).extension_id.to_string())
+            })
+            .collect();
+
+        let active_index = self
+            .active_pane
+            .read(cx)
+            .active_item()
+            .and_then(|item| item.downcast::<ExtensionGuiView>())
+            .and_then(|active_view| {
+                let active_id = active_view.read(cx).extension_id.clone();
+                open_extensions
+                    .iter()
+                    .position(|id| id.as_str() == active_id.as_ref())
+            });
+
+        let serialized = SerializedExtensionPanel {
+            open_extensions: open_extensions.clone(),
+            active_index,
+        };
+
+        self.pending_serialization = cx.background_executor().spawn(async move {
+            KEY_VALUE_STORE
+                .write_kvp(
+                    EXTENSION_PANEL_KEY.to_string(),
+                    serde_json::to_string(&serialized).ok()?,
+                )
+                .await
+                .log_err()
+        });
     }
 
     pub fn add_view(
@@ -686,6 +770,7 @@ impl ExtensionGuiPanel {
         self.active_pane.update(cx, |pane, cx| {
             pane.add_item(Box::new(view.clone()), true, true, None, window, cx);
         });
+        self.serialize(cx);
         view
     }
 
@@ -712,8 +797,10 @@ impl ExtensionGuiPanel {
             self.active_pane.update(cx, |pane, cx| {
                 pane.activate_item(ix, true, true, window, cx);
             });
+            self.serialize(cx);
             None
         } else {
+            // add_view calls serialize internally
             Some(self.add_view(manifest, wasm, window, cx))
         };
         cx.emit(PanelEvent::Activate);
@@ -746,6 +833,9 @@ fn new_extension_pane(
         // Disable pane-level zoom so ToggleZoom action propagates rather than emitting
         // pane::Event::ZoomIn/ZoomOut (which the workspace ignores for non-workspace panes).
         pane.set_can_toggle_zoom(false, cx);
+        // Keep pane alive when all tabs are closed so the panel stays visible
+        // and the dock button continues to work as a toggle.
+        pane.set_close_pane_if_empty(false, cx);
 
         // Custom tab bar buttons: emit PanelEvent::ZoomIn/ZoomOut on the panel so the
         // dock correctly updates workspace.zoomed.
@@ -875,8 +965,26 @@ impl Panel for ExtensionGuiPanel {
 }
 
 impl Render for ExtensionGuiPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.active_pane.clone())
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.active_pane.read(cx).items_len() > 0 {
+            div().size_full().child(self.active_pane.clone())
+        } else {
+            // When pane is empty, render a placeholder that tracks the pane's focus handle
+            // so the dock toggle button continues to work. Avoid rendering the pane itself
+            // since its empty-placeholder dispatches ToggleFocus on double-click, which
+            // would unexpectedly close the panel.
+            let pane_focus = self.active_pane.focus_handle(cx);
+            div()
+                .track_focus(&pane_focus)
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    Label::new("Open an extension from the command palette")
+                        .color(Color::Muted),
+                )
+        }
     }
 }
 
@@ -1006,32 +1114,53 @@ pub fn init(cx: &mut App) {
                 window,
                 |workspace, _, event, window, cx| match event {
                     extension_host::Event::GuiExtensionLoaded(manifest, wasm_extension) => {
+                        // Check if we need to restore this extension
                         if let Some(panel) = workspace.panel::<ExtensionGuiPanel>(cx) {
-                            let manifest = manifest.clone();
-                            let wasm = wasm_extension.clone();
-
-                            // Add view and subscribe to events
-                            let view = panel.update(cx, |panel, cx| {
-                                panel.add_view(manifest, wasm, window, cx)
+                            let extension_id = manifest.id.as_ref();
+                            let should_restore = panel.read(cx).pending_restore.as_ref().map_or(false, |restore| {
+                                restore.open_extensions.iter().any(|id| id == extension_id)
                             });
 
-                            cx.subscribe_in(
-                                &view,
-                                window,
-                                |workspace: &mut Workspace, _view, event: &ExtensionViewEvent, window, cx| {
-                                    match event {
-                                        ExtensionViewEvent::OpenFile(path) => {
-                                            workspace.open_abs_path(
-                                                path.clone(),
-                                                OpenOptions::default(),
-                                                window,
-                                                cx,
-                                            ).detach();
+                            if should_restore {
+                                let manifest = manifest.clone();
+                                let wasm = wasm_extension.clone();
+
+                                let view = panel.update(cx, |panel, cx| {
+                                    panel.add_view(manifest.clone(), wasm, window, cx)
+                                });
+
+                                // Subscribe to file open events
+                                cx.subscribe_in(
+                                    &view,
+                                    window,
+                                    |workspace: &mut Workspace, _view, event: &ExtensionViewEvent, window, cx| {
+                                        let ExtensionViewEvent::OpenFile(path) = event;
+                                        workspace.open_abs_path(
+                                            path.clone(),
+                                            OpenOptions::default(),
+                                            window,
+                                            cx,
+                                        ).detach();
+                                    },
+                                )
+                                .detach();
+
+                                // Check if all extensions are restored and activate the right tab
+                                panel.update(cx, |panel, cx| {
+                                    if let Some(restore) = &panel.pending_restore {
+                                        let current_count = panel.active_pane.read(cx).items_len();
+                                        if current_count == restore.open_extensions.len() {
+                                            // Activate the originally active tab
+                                            if let Some(active_idx) = restore.active_index {
+                                                panel.active_pane.update(cx, |pane, cx| {
+                                                    pane.activate_item(active_idx, false, false, window, cx);
+                                                });
+                                            }
+                                            panel.pending_restore = None;
                                         }
                                     }
-                                },
-                            )
-                            .detach();
+                                });
+                            }
                         }
                     }
                     extension_host::Event::ExtensionCommandRegistered {

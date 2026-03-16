@@ -245,8 +245,10 @@ impl Extension for GitPanel {
             }
             "commit-input" => {
                 if let zed::gui::UiEvent::InputChanged(new_value) = event {
+                    #[cfg(debug_assertions)]
                     eprintln!("[gui-test v0.1.2] InputChanged event received: '{}'", new_value);
                     self.commit_message = new_value;
+                    #[cfg(debug_assertions)]
                     eprintln!("[gui-test v0.1.2] Updated commit_message to: '{}'", self.commit_message);
                 }
                 return;
@@ -732,6 +734,7 @@ impl Extension for GitPanel {
             );
 
         let tree = ui::render_tree(root);
+        #[cfg(debug_assertions)]
         eprintln!("[gui-test] gui_render: Ready -> tree nodes={} root={}", tree.nodes.len(), tree.root);
         tree
     }

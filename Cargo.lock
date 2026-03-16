@@ -6107,6 +6107,7 @@ dependencies = [
  "anyhow",
  "collections",
  "command_palette_hooks",
+ "db",
  "extension_host",
  "futures 0.3.31",
  "gpui",

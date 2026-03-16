@@ -1,38 +1,16 @@
-use ui_input::InputField;
-use extension_host::wasm_host::wit;
+use crate::event_handlers;
+use crate::wit_types::*;
+use extension_host::wasm_host::{WasmExtension, wit};
 use gpui::{
-    AbsoluteLength, AlignContent, AlignItems, AnyElement, App, ClickEvent, Corners, CursorStyle,
+    AbsoluteLength, AlignContent, AlignItems, AnyElement, App, Corners, CursorStyle,
     DefiniteLength, Display, Edges, ElementId, Entity, Fill, FlexDirection, FlexWrap, FocusHandle, FontStyle,
     FontWeight, Hsla, IntoElement, Length, Overflow, Position, SharedString,
-    Visibility, Window, div, hsla, px, rems, prelude::*,
+    Visibility, Window, div, hsla, px, rems, uniform_list, prelude::*,
 };
 use std::sync::{Arc, Mutex};
 use theme::ActiveTheme as _;
 use ui;
-
-type WitUiTree = wit::since_v0_9_0::ui_elements::UiTree;
-type WitUiNode = wit::since_v0_9_0::ui_elements::UiNode;
-type WitStyle = wit::since_v0_9_0::ui_elements::Style;
-type WitColor = wit::since_v0_9_0::ui_elements::Color;
-type WitLength = wit::since_v0_9_0::ui_elements::Length;
-type WitDefiniteLength = wit::since_v0_9_0::ui_elements::DefiniteLength;
-type WitAbsoluteLength = wit::since_v0_9_0::ui_elements::AbsoluteLength;
-type WitBackground = wit::since_v0_9_0::ui_elements::Background;
-type WitEdgesLength = wit::since_v0_9_0::ui_elements::EdgesLength;
-type WitEdgesAbsolute = wit::since_v0_9_0::ui_elements::EdgesAbsolute;
-type WitCornersAbsolute = wit::since_v0_9_0::ui_elements::CornersAbsolute;
-type WitDivNode = wit::since_v0_9_0::ui_elements::DivNode;
-type WitTextNode = wit::since_v0_9_0::ui_elements::TextNode;
-type WitInputNode = wit::since_v0_9_0::ui_elements::InputNode;
-type WitSvgNode = wit::since_v0_9_0::ui_elements::SvgNode;
-type WitImgNode = wit::since_v0_9_0::ui_elements::ImgNode;
-type WitIconSource = wit::since_v0_9_0::ui_elements::IconSource;
-pub type WitUiEvent = wit::since_v0_9_0::gui::UiEvent;
-type WitMouseEventData = wit::since_v0_9_0::gui::MouseEventData;
-
-// ── Input Selection State ─────────────────────────────────────────────────
-
-// Input state management removed - InputField handles this internally
+use ui_input::InputField;
 
 // ── UI Tree Rendering ──────────────────────────────────────────────────────
 
@@ -43,18 +21,20 @@ type WitMouseEventData = wit::since_v0_9_0::gui::MouseEventData;
 /// event to the extension and re-rendering.
 ///
 /// `focus_handles` maps WIT focus handle IDs to GPUI FocusHandles.
+/// `wasm` is needed to render UniformList items via `call_gui_render_list_item`.
 pub fn render_ui_tree(
     tree: &WitUiTree,
     on_event: impl Fn(String, WitUiEvent, &mut Window, &mut App) + Clone + 'static,
     focus_handles: Arc<Mutex<std::collections::HashMap<u32, FocusHandle>>>,
     text_input_fields: &std::collections::HashMap<String, Entity<InputField>>,
+    wasm: Arc<WasmExtension>,
     window: &mut Window,
     cx: &App,
 ) -> AnyElement {
     if tree.nodes.is_empty() {
         return div().into_any_element();
     }
-    render_node(&tree.nodes, tree.root, &on_event, &focus_handles, text_input_fields, window, cx)
+    render_node(&tree.nodes, tree.root, &on_event, &focus_handles, text_input_fields, &wasm, window, cx)
 }
 
 fn render_node(
@@ -63,17 +43,18 @@ fn render_node(
     on_event: &(impl Fn(String, WitUiEvent, &mut Window, &mut App) + Clone + 'static),
     focus_handles: &Arc<Mutex<std::collections::HashMap<u32, FocusHandle>>>,
     text_input_fields: &std::collections::HashMap<String, Entity<InputField>>,
+    wasm: &Arc<WasmExtension>,
     window: &mut Window,
     cx: &App,
 ) -> AnyElement {
     match nodes.get(idx as usize) {
         None => div().into_any_element(),
-        Some(WitUiNode::Div(n)) => render_div(nodes, n, idx, on_event, focus_handles, text_input_fields, window, cx),
+        Some(WitUiNode::Div(n)) => render_div(nodes, n, idx, on_event, focus_handles, text_input_fields, wasm, window, cx),
         Some(WitUiNode::Text(n)) => render_text(n, cx),
         Some(WitUiNode::Svg(n)) => render_svg(n, cx),
         Some(WitUiNode::Img(n)) => render_img(n, on_event, cx),
         Some(WitUiNode::Input(n)) => render_input(n, text_input_fields, cx),
-        Some(WitUiNode::UniformList(n)) => render_uniform_list(n, on_event, focus_handles, window, cx),
+        Some(WitUiNode::UniformList(n)) => render_uniform_list(n, on_event, focus_handles, wasm, window, cx),
     }
 }
 
@@ -84,6 +65,7 @@ fn render_div(
     on_event: &(impl Fn(String, WitUiEvent, &mut Window, &mut App) + Clone + 'static),
     focus_handles: &Arc<Mutex<std::collections::HashMap<u32, FocusHandle>>>,
     text_input_fields: &std::collections::HashMap<String, Entity<InputField>>,
+    wasm: &Arc<WasmExtension>,
     window: &mut Window,
     cx: &App,
 ) -> AnyElement {
@@ -97,243 +79,14 @@ fn render_div(
     apply_style(&mut element, &n.style, cx);
 
     for &child_idx in &n.children {
-        element = element.child(render_node(nodes, child_idx, on_event, focus_handles, text_input_fields, window, cx));
+        element = element.child(render_node(nodes, child_idx, on_event, focus_handles, text_input_fields, wasm, window, cx));
     }
 
-    // Handle click and double-click with the same handler
-    if n.events.on_click || n.events.on_double_click {
-        let source_id = n.id.clone().unwrap_or_default();
-        let cb = on_event.clone();
-        let handle_double = n.events.on_double_click;
-        let handle_single = n.events.on_click;
-        element = element.on_click(move |click, window, cx| {
-            let mouse_data = mouse_data_from_click(click);
-            // Check click count for double-click
-            if handle_double && mouse_data.click_count >= 2 {
-                cb(
-                    source_id.clone(),
-                    WitUiEvent::DoubleClicked(mouse_data),
-                    window,
-                    cx,
-                );
-            } else if handle_single {
-                cb(
-                    source_id.clone(),
-                    WitUiEvent::Clicked(mouse_data),
-                    window,
-                    cx,
-                );
-            }
-        });
-    }
-
-    // Right-click uses on_aux_click
-    if n.events.on_right_click {
-        let source_id = n.id.clone().unwrap_or_default();
-        let cb = on_event.clone();
-        element = element.on_aux_click(move |click, window, cx| {
-            cb(
-                source_id.clone(),
-                WitUiEvent::RightClicked(mouse_data_from_click(click)),
-                window,
-                cx,
-            );
-        });
-    }
-
-    if n.events.on_hover {
-        let source_id = n.id.clone().unwrap_or_default();
-        let cb = on_event.clone();
-        element = element.on_hover(move |hovered, window, cx| {
-            let event = if *hovered {
-                WitUiEvent::HoverStart
-            } else {
-                WitUiEvent::HoverEnd
-            };
-            cb(source_id.clone(), event, window, cx);
-        });
-    }
-
-    if n.events.on_mouse_down {
-        let source_id = n.id.clone().unwrap_or_default();
-        let cb = on_event.clone();
-        element = element.on_mouse_down(gpui::MouseButton::Left, move |event, window, cx| {
-            cb(
-                source_id.clone(),
-                WitUiEvent::MouseDown(WitMouseEventData {
-                    x: f32::from(event.position.x),
-                    y: f32::from(event.position.y),
-                    button: 0,
-                    click_count: 0,
-                    shift: event.modifiers.shift,
-                    ctrl: event.modifiers.control,
-                    alt: event.modifiers.alt,
-                    meta: event.modifiers.platform,
-                }),
-                window,
-                cx,
-            );
-        });
-    }
-
-    if n.events.on_mouse_up {
-        let source_id = n.id.clone().unwrap_or_default();
-        let cb = on_event.clone();
-        element = element.on_mouse_up(gpui::MouseButton::Left, move |event, window, cx| {
-            cb(
-                source_id.clone(),
-                WitUiEvent::MouseUp(WitMouseEventData {
-                    x: f32::from(event.position.x),
-                    y: f32::from(event.position.y),
-                    button: 0,
-                    click_count: 0,
-                    shift: event.modifiers.shift,
-                    ctrl: event.modifiers.control,
-                    alt: event.modifiers.alt,
-                    meta: event.modifiers.platform,
-                }),
-                window,
-                cx,
-            );
-        });
-    }
-
-    if n.events.on_mouse_move {
-        let source_id = n.id.clone().unwrap_or_default();
-        let cb = on_event.clone();
-        element = element.on_mouse_move(move |event, window, cx| {
-            cb(
-                source_id.clone(),
-                WitUiEvent::MouseMoved(WitMouseEventData {
-                    x: f32::from(event.position.x),
-                    y: f32::from(event.position.y),
-                    button: 0,
-                    click_count: 0,
-                    shift: event.modifiers.shift,
-                    ctrl: event.modifiers.control,
-                    alt: event.modifiers.alt,
-                    meta: event.modifiers.platform,
-                }),
-                window,
-                cx,
-            );
-        });
-    }
-
-    if n.events.on_scroll_wheel {
-        let source_id = n.id.clone().unwrap_or_default();
-        let cb = on_event.clone();
-        element = element.on_scroll_wheel(move |event, window, cx| {
-            let pixel_delta = event.delta.pixel_delta(window.line_height());
-            cb(
-                source_id.clone(),
-                WitUiEvent::ScrollWheel(wit::since_v0_9_0::gui::ScrollEventData {
-                    delta_x: f32::from(pixel_delta.x),
-                    delta_y: f32::from(pixel_delta.y),
-                    precise: event.delta.precise(),
-                }),
-                window,
-                cx,
-            );
-        });
-    }
-
-    if n.events.on_key_down {
-        let source_id = n.id.clone().unwrap_or_default();
-        let cb = on_event.clone();
-        element = element.on_key_down(move |event, window, cx| {
-            cb(
-                source_id.clone(),
-                WitUiEvent::KeyDown(wit::since_v0_9_0::gui::KeyEventData {
-                    key: event.keystroke.key.clone(),
-                    shift: event.keystroke.modifiers.shift,
-                    ctrl: event.keystroke.modifiers.control,
-                    alt: event.keystroke.modifiers.alt,
-                    meta: event.keystroke.modifiers.platform,
-                    repeat: false, // GPUI doesn't expose repeat in KeyDownEvent
-                }),
-                window,
-                cx,
-            );
-        });
-    }
-
-    if n.events.on_key_up {
-        let source_id = n.id.clone().unwrap_or_default();
-        let cb = on_event.clone();
-        element = element.on_key_up(move |event, window, cx| {
-            cb(
-                source_id.clone(),
-                WitUiEvent::KeyUp(wit::since_v0_9_0::gui::KeyEventData {
-                    key: event.keystroke.key.clone(),
-                    shift: event.keystroke.modifiers.shift,
-                    ctrl: event.keystroke.modifiers.control,
-                    alt: event.keystroke.modifiers.alt,
-                    meta: event.keystroke.modifiers.platform,
-                    repeat: false,
-                }),
-                window,
-                cx,
-            );
-        });
-    }
-
-    // Focus handle integration - use pre-created GPUI FocusHandle
-    if let Some(handle_id) = n.focus_handle_id {
-        // Get the pre-created FocusHandle for this element
-        let focus_handle = {
-            let handles = focus_handles.lock().unwrap();
-            handles.get(&handle_id).cloned()
-        };
-
-        if let Some(focus_handle) = focus_handle {
-            // Track focus with GPUI - this enables tab navigation and focus styling
-            element = element.track_focus(&focus_handle);
-
-            // Note: GPUI doesn't have on_focus_in/on_focus_out element methods.
-            // Focus events need to be subscribed via cx.on_focus_in/cx.on_focus_out
-            // which requires a Context, not available during render.
-            // The extension can detect focus changes by checking is_focused() on key events
-            // or we need to subscribe in ExtensionGuiView::new() and emit events there.
-            // For now, we mark the element focusable via track_focus which enables:
-            // - Tab navigation between focusable elements
-            // - Focus styling (can use .focus() style modifier)
-            // - Focus checking in key event handlers
-        }
-    }
-
-    // Drag events - notify drag started (full drag preview needs complex setup)
-    if n.events.on_drag {
-        let source_id = n.id.clone().unwrap_or_default();
-        let cb = on_event.clone();
-        // Send DragStarted event on mouse down
-        // Full drag-and-drop with preview would require Entity<W> constructor
-        // which is too complex for WIT boundary - extensions can handle drag manually
-        if !n.events.on_mouse_down {
-            element = element.on_mouse_down(gpui::MouseButton::Left, move |_event, window, cx| {
-                cb(
-                    source_id.clone(),
-                    WitUiEvent::DragStarted,
-                    window,
-                    cx,
-                );
-            });
-        }
-    }
-
-    // Drop events
-    if n.events.on_drop {
-        let source_id = n.id.clone().unwrap_or_default();
-        let cb = on_event.clone();
-        element = element.on_drop(move |data: &String, window, cx| {
-            cb(
-                source_id.clone(),
-                WitUiEvent::Dropped(data.clone()),
-                window,
-                cx,
-            );
-        });
-    }
+    // Attach event handlers using helper functions
+    element = event_handlers::attach_mouse_event_handlers(element, &n.id, &n.events, on_event);
+    element = event_handlers::attach_keyboard_event_handlers(element, &n.id, &n.events, on_event);
+    element = event_handlers::attach_drag_drop_handlers(element, &n.id, &n.events, on_event);
+    element = event_handlers::attach_focus_handler(element, n.focus_handle_id, focus_handles);
 
     if let Some(tooltip_text) = n.tooltip.clone() {
         element = element.tooltip(ui::Tooltip::text(tooltip_text));
@@ -439,7 +192,7 @@ fn render_img(n: &WitImgNode, on_event: &(impl Fn(String, WitUiEvent, &mut Windo
         element = element.on_click(move |click, window, cx| {
             cb(
                 source_id.clone(),
-                WitUiEvent::Clicked(mouse_data_from_click(click)),
+                WitUiEvent::Clicked(event_handlers::mouse_data_from_click(click)),
                 window,
                 cx,
             );
@@ -461,13 +214,19 @@ fn render_img(n: &WitImgNode, on_event: &(impl Fn(String, WitUiEvent, &mut Windo
 // ── Style application ──────────────────────────────────────────────────────
 
 fn apply_style(element: &mut impl Styled, s: &WitStyle, cx: &App) {
-    use wit::since_v0_9_0::ui_elements::{
-        AlignContent as WitAC, AlignItems as WitAI, CursorStyle as WitCursor, DisplayType,
-        FlexDirection as WitFD, FlexWrap as WitFW, FontStyle as WitFS,
-        FontWeight as WitFontWeight, OverflowType, PositionType, VisibilityType,
-    };
-
     let sr = element.style();
+    apply_layout_styles(sr, s);
+    apply_size_styles(sr, s);
+    apply_spacing_styles(sr, s);
+    apply_visual_styles(sr, s, cx);
+    apply_text_styles(sr, s, cx);
+    apply_overflow_cursor_styles(sr, s);
+}
+
+fn apply_layout_styles(sr: &mut gpui::StyleRefinement, s: &WitStyle) {
+    use wit::since_v0_9_0::ui_elements::{
+        DisplayType, FlexDirection as WitFD, FlexWrap as WitFW, PositionType, VisibilityType,
+    };
 
     if let Some(d) = &s.display {
         sr.display = Some(match d {
@@ -488,6 +247,46 @@ fn apply_style(element: &mut impl Styled, s: &WitStyle, cx: &App) {
         });
     }
 
+    if let Some(fd) = &s.flex_direction {
+        sr.flex_direction = Some(match fd {
+            WitFD::Row => FlexDirection::Row,
+            WitFD::Column => FlexDirection::Column,
+            WitFD::RowReverse => FlexDirection::RowReverse,
+            WitFD::ColumnReverse => FlexDirection::ColumnReverse,
+        });
+    }
+    if let Some(fw) = &s.flex_wrap {
+        sr.flex_wrap = Some(match fw {
+            WitFW::NoWrap => FlexWrap::NoWrap,
+            WitFW::Wrap => FlexWrap::Wrap,
+            WitFW::WrapReverse => FlexWrap::WrapReverse,
+        });
+    }
+    if let Some(ai) = &s.align_items {
+        sr.align_items = Some(cvt_align_items(ai));
+    }
+    if let Some(ac) = &s.align_content {
+        sr.align_content = Some(cvt_align_content(ac));
+    }
+    if let Some(jc) = &s.justify_content {
+        sr.justify_content = Some(cvt_justify_content(jc));
+    }
+
+    if let Some(fg) = s.flex_grow {
+        sr.flex_grow = Some(fg);
+    }
+    if let Some(fs) = s.flex_shrink {
+        sr.flex_shrink = Some(fs);
+    }
+    if let Some(fb) = &s.flex_basis {
+        sr.flex_basis = Some(cvt_length(fb));
+    }
+    if let Some(aself) = &s.align_self {
+        sr.align_self = Some(cvt_align_items(aself));
+    }
+}
+
+fn apply_size_styles(sr: &mut gpui::StyleRefinement, s: &WitStyle) {
     if let Some(w) = &s.width {
         sr.size.width = Some(cvt_length(w));
     }
@@ -519,56 +318,9 @@ fn apply_style(element: &mut impl Styled, s: &WitStyle, cx: &App) {
     if let Some(l) = &s.left {
         sr.inset.left = Some(cvt_length(l));
     }
+}
 
-    if let Some(fd) = &s.flex_direction {
-        sr.flex_direction = Some(match fd {
-            WitFD::Row => FlexDirection::Row,
-            WitFD::Column => FlexDirection::Column,
-            WitFD::RowReverse => FlexDirection::RowReverse,
-            WitFD::ColumnReverse => FlexDirection::ColumnReverse,
-        });
-    }
-    if let Some(fw) = &s.flex_wrap {
-        sr.flex_wrap = Some(match fw {
-            WitFW::NoWrap => FlexWrap::NoWrap,
-            WitFW::Wrap => FlexWrap::Wrap,
-            WitFW::WrapReverse => FlexWrap::WrapReverse,
-        });
-    }
-    if let Some(ai) = &s.align_items {
-        sr.align_items = Some(cvt_align_items(ai, &WitAI::Stretch));
-    }
-    if let Some(ac) = &s.align_content {
-        sr.align_content = Some(cvt_align_content(ac, &WitAC::Stretch));
-    }
-    if let Some(jc) = &s.justify_content {
-        sr.justify_content = Some(cvt_justify_content(jc));
-    }
-    if let Some(g) = &s.gap {
-        let v = cvt_definite(g);
-        sr.gap.width = Some(v);
-        sr.gap.height = Some(v);
-    }
-    if let Some(g) = &s.column_gap {
-        sr.gap.width = Some(cvt_definite(g));
-    }
-    if let Some(g) = &s.row_gap {
-        sr.gap.height = Some(cvt_definite(g));
-    }
-
-    if let Some(fg) = s.flex_grow {
-        sr.flex_grow = Some(fg);
-    }
-    if let Some(fs) = s.flex_shrink {
-        sr.flex_shrink = Some(fs);
-    }
-    if let Some(fb) = &s.flex_basis {
-        sr.flex_basis = Some(cvt_length(fb));
-    }
-    if let Some(aself) = &s.align_self {
-        sr.align_self = Some(cvt_align_items(aself, &WitAI::Stretch));
-    }
-
+fn apply_spacing_styles(sr: &mut gpui::StyleRefinement, s: &WitStyle) {
     if let Some(p) = &s.padding {
         let e = cvt_edges_definite(p);
         sr.padding.top = Some(e.top);
@@ -584,6 +336,20 @@ fn apply_style(element: &mut impl Styled, s: &WitStyle, cx: &App) {
         sr.margin.left = Some(e.left);
     }
 
+    if let Some(g) = &s.gap {
+        let v = cvt_definite(g);
+        sr.gap.width = Some(v);
+        sr.gap.height = Some(v);
+    }
+    if let Some(g) = &s.column_gap {
+        sr.gap.width = Some(cvt_definite(g));
+    }
+    if let Some(g) = &s.row_gap {
+        sr.gap.height = Some(cvt_definite(g));
+    }
+}
+
+fn apply_visual_styles(sr: &mut gpui::StyleRefinement, s: &WitStyle, cx: &App) {
     if let Some(bg) = &s.background {
         if let Some(color) = resolve_background(bg, cx) {
             sr.background = Some(Fill::from(color));
@@ -632,6 +398,10 @@ fn apply_style(element: &mut impl Styled, s: &WitStyle, cx: &App) {
                 .collect(),
         );
     }
+}
+
+fn apply_text_styles(sr: &mut gpui::StyleRefinement, s: &WitStyle, cx: &App) {
+    use wit::since_v0_9_0::ui_elements::{FontStyle as WitFS, FontWeight as WitFontWeight};
 
     if let Some(ts) = &s.text_size {
         sr.text.font_size = Some(cvt_absolute(ts));
@@ -661,6 +431,10 @@ fn apply_style(element: &mut impl Styled, s: &WitStyle, cx: &App) {
     if let Some(family) = &s.font_family {
         sr.text.font_family = Some(SharedString::from(family.clone()));
     }
+}
+
+fn apply_overflow_cursor_styles(sr: &mut gpui::StyleRefinement, s: &WitStyle) {
+    use wit::since_v0_9_0::ui_elements::{CursorStyle as WitCursor, OverflowType};
 
     if let Some(ox) = &s.overflow_x {
         sr.overflow.x = Some(match ox {
@@ -772,7 +546,7 @@ fn cvt_corners(c: &WitCornersAbsolute) -> Corners<AbsoluteLength> {
     }
 }
 
-fn cvt_align_items(a: &wit::since_v0_9_0::ui_elements::AlignItems, _default: &wit::since_v0_9_0::ui_elements::AlignItems) -> AlignItems {
+fn cvt_align_items(a: &wit::since_v0_9_0::ui_elements::AlignItems) -> AlignItems {
     use wit::since_v0_9_0::ui_elements::AlignItems as WitAI;
     match a {
         WitAI::Start => AlignItems::Start,
@@ -785,7 +559,7 @@ fn cvt_align_items(a: &wit::since_v0_9_0::ui_elements::AlignItems, _default: &wi
     }
 }
 
-fn cvt_align_content(a: &wit::since_v0_9_0::ui_elements::AlignContent, _default: &wit::since_v0_9_0::ui_elements::AlignContent) -> AlignContent {
+fn cvt_align_content(a: &wit::since_v0_9_0::ui_elements::AlignContent) -> AlignContent {
     use wit::since_v0_9_0::ui_elements::AlignContent as WitAC;
     match a {
         WitAC::Start => AlignContent::Start,
@@ -860,46 +634,56 @@ fn resolve_background(bg: &WitBackground, cx: &App) -> Option<Hsla> {
 }
 
 fn render_uniform_list(
-    n: &wit::since_v0_9_0::ui_elements::UniformListNode,
+    n: &WitUniformListNode,
     _on_event: &(impl Fn(String, WitUiEvent, &mut Window, &mut App) + Clone + 'static),
     _focus_handles: &Arc<Mutex<std::collections::HashMap<u32, FocusHandle>>>,
+    _wasm: &Arc<WasmExtension>,
     _window: &mut Window,
-    _cx: &App,
+    cx: &App,
 ) -> AnyElement {
-    // UniformList rendering needs the WASM extension but we don't have it in this context
-    // For now, render a placeholder - proper implementation would need architecture changes
-    let _ = n;
-    div()
-        .child("UniformList not yet supported with focus handles")
-        .into_any_element()
+    let list_id = n.id.clone();
+    let item_count = n.item_count as usize;
+    let item_height = px(n.item_height);
+
+    // TODO: Full UniformList implementation
+    //
+    // Challenge: GPUI's uniform_list requires a synchronous render closure,
+    // but calling wasm.call_gui_render_list_item() is async.
+    //
+    // Solution architecture needed:
+    // 1. ExtensionGuiView should maintain a cache: HashMap<(list_id, index), UiTree>
+    // 2. On first render or scroll, spawn async tasks to pre-fetch visible items
+    // 3. Store rendered items in cache
+    // 4. Pass cache reference to render_ui_tree()
+    // 5. In this function, look up items from cache synchronously
+    // 6. If item not in cache, render placeholder and trigger async fetch
+    //
+    // For now, render a simple scrollable list of placeholders to unblock other work.
+
+    let mut list = uniform_list(
+        ElementId::Name(list_id.into()),
+        item_count,
+        move |visible_range, _window, _cx| {
+            visible_range
+                .map(|ix| {
+                    div()
+                        .h(item_height)
+                        .flex()
+                        .items_center()
+                        .px_2()
+                        .child(format!("UniformList item {} - pending full implementation", ix))
+                        .into_any_element()
+                })
+                .collect()
+        },
+    );
+
+    apply_style(&mut list, &n.style, cx);
+
+    if n.fill_width {
+        list = list.w_full();
+    }
+
+    list.into_any_element()
 }
 
-fn mouse_data_from_click(click: &ClickEvent) -> WitMouseEventData {
-    match click {
-        ClickEvent::Mouse(m) => WitMouseEventData {
-            x: f32::from(m.down.position.x),
-            y: f32::from(m.down.position.y),
-            button: match m.down.button {
-                gpui::MouseButton::Left => 0,
-                gpui::MouseButton::Right => 1,
-                gpui::MouseButton::Middle => 2,
-                _ => 0,
-            },
-            click_count: m.down.click_count as u32,
-            shift: m.down.modifiers.shift,
-            ctrl: m.down.modifiers.control,
-            alt: m.down.modifiers.alt,
-            meta: m.down.modifiers.platform,
-        },
-        ClickEvent::Keyboard(_) => WitMouseEventData {
-            x: 0.0,
-            y: 0.0,
-            button: 0,
-            click_count: 1,
-            shift: false,
-            ctrl: false,
-            alt: false,
-            meta: false,
-        },
-    }
-}

@@ -468,10 +468,21 @@ impl ExtensionsPage {
             Some(ExtensionOperation::Install) => ExtensionStatus::Installing,
             Some(ExtensionOperation::Remove) => ExtensionStatus::Removing,
             Some(ExtensionOperation::Upgrade) => ExtensionStatus::Upgrading,
-            None => match extension_store.installed_extensions().get(extension_id) {
-                Some(extension) => ExtensionStatus::Installed(extension.manifest.version.clone()),
-                None => ExtensionStatus::NotInstalled,
-            },
+            None => {
+                // Check dev extensions first (symlinked extensions)
+                if let Some(dev_extension) = extension_store
+                    .dev_extensions()
+                    .find(|dev_ext| dev_ext.id.as_ref() == extension_id)
+                {
+                    return ExtensionStatus::Installed(dev_extension.version.clone());
+                }
+
+                // Then check installed extensions
+                match extension_store.installed_extensions().get(extension_id) {
+                    Some(extension) => ExtensionStatus::Installed(extension.manifest.version.clone()),
+                    None => ExtensionStatus::NotInstalled,
+                }
+            }
         }
     }
 
