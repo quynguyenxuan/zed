@@ -229,11 +229,8 @@ impl Extension for ProjectPanel {
                         }
                         EntryKind::File => {
                             let path = entry.path.clone();
-                            let params = format!(
-                                r#"{{"path":"{}"}}"#,
-                                path.replace('\\', "\\\\").replace('"', "\\\"")
-                            );
-                            let _ = zed::gui::call("", "open_file", &params);
+                            // Emit via pub-sub for host to handle
+                            let _ = zed::pub_sub::publish("ext.open-file", &path);
                         }
                     }
                 }
@@ -284,6 +281,15 @@ impl Extension for ProjectPanel {
         let mut root = v_flex()
             .size_full()
             .overflow_y_scroll()
+            // ── Extension version ────────────────────────────────────────
+            .child(
+                h_flex()
+                    .px_3()
+                    .py_1()
+                    .justify_end()
+                    .child(Label::new("v0.1.0").muted().text_xs()),
+            )
+            // ── Repository header ────────────────────────────────────────
             .child(
                 h_flex()
                     .px_3()

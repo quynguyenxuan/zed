@@ -1,16 +1,14 @@
+use ui_input::InputField;
 use extension_host::wasm_host::wit;
 use gpui::{
     AbsoluteLength, AlignContent, AlignItems, AnyElement, App, ClickEvent, Corners, CursorStyle,
-    DefiniteLength, Display, Edges, ElementId, Fill, FlexDirection, FlexWrap, FocusHandle, FontStyle,
+    DefiniteLength, Display, Edges, ElementId, Entity, Fill, FlexDirection, FlexWrap, FocusHandle, FontStyle,
     FontWeight, Hsla, IntoElement, Length, Overflow, Position, SharedString,
     Visibility, Window, div, hsla, px, rems, prelude::*,
 };
-use std::collections::HashMap;
-use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use theme::ActiveTheme as _;
 use ui;
-use unicode_segmentation::UnicodeSegmentation;
 
 type WitUiTree = wit::since_v0_9_0::ui_elements::UiTree;
 type WitUiNode = wit::since_v0_9_0::ui_elements::UiNode;
@@ -34,62 +32,7 @@ type WitMouseEventData = wit::since_v0_9_0::gui::MouseEventData;
 
 // ── Input Selection State ─────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
-struct InputState {
-    selected_range: Range<usize>,
-    selection_reversed: bool,
-}
-
-impl Default for InputState {
-    fn default() -> Self {
-        Self {
-            selected_range: 0..0,
-            selection_reversed: false,
-        }
-    }
-}
-
-fn input_states() -> &'static Mutex<HashMap<String, InputState>> {
-    static INPUT_STATES: std::sync::OnceLock<Mutex<HashMap<String, InputState>>> =
-        std::sync::OnceLock::new();
-    INPUT_STATES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn get_input_state(input_id: &str) -> InputState {
-    input_states()
-        .lock()
-        .unwrap()
-        .get(input_id)
-        .cloned()
-        .unwrap_or_default()
-}
-
-fn set_input_state(input_id: String, state: InputState) {
-    input_states().lock().unwrap().insert(input_id, state);
-}
-
-fn cursor_offset(state: &InputState) -> usize {
-    if state.selection_reversed {
-        state.selected_range.start
-    } else {
-        state.selected_range.end
-    }
-}
-
-fn previous_boundary(content: &str, offset: usize) -> usize {
-    content
-        .grapheme_indices(true)
-        .rev()
-        .find_map(|(idx, _)| (idx < offset).then_some(idx))
-        .unwrap_or(0)
-}
-
-fn next_boundary(content: &str, offset: usize) -> usize {
-    content
-        .grapheme_indices(true)
-        .find_map(|(idx, _)| (idx > offset).then_some(idx))
-        .unwrap_or(content.len())
-}
+// Input state management removed - InputField handles this internally
 
 // ── UI Tree Rendering ──────────────────────────────────────────────────────
 
@@ -104,13 +47,14 @@ pub fn render_ui_tree(
     tree: &WitUiTree,
     on_event: impl Fn(String, WitUiEvent, &mut Window, &mut App) + Clone + 'static,
     focus_handles: Arc<Mutex<std::collections::HashMap<u32, FocusHandle>>>,
+    text_input_fields: &std::collections::HashMap<String, Entity<InputField>>,
     window: &mut Window,
     cx: &App,
 ) -> AnyElement {
     if tree.nodes.is_empty() {
         return div().into_any_element();
     }
-    render_node(&tree.nodes, tree.root, &on_event, &focus_handles, window, cx)
+    render_node(&tree.nodes, tree.root, &on_event, &focus_handles, text_input_fields, window, cx)
 }
 
 fn render_node(
@@ -118,16 +62,17 @@ fn render_node(
     idx: u32,
     on_event: &(impl Fn(String, WitUiEvent, &mut Window, &mut App) + Clone + 'static),
     focus_handles: &Arc<Mutex<std::collections::HashMap<u32, FocusHandle>>>,
+    text_input_fields: &std::collections::HashMap<String, Entity<InputField>>,
     window: &mut Window,
     cx: &App,
 ) -> AnyElement {
     match nodes.get(idx as usize) {
         None => div().into_any_element(),
-        Some(WitUiNode::Div(n)) => render_div(nodes, n, idx, on_event, focus_handles, window, cx),
+        Some(WitUiNode::Div(n)) => render_div(nodes, n, idx, on_event, focus_handles, text_input_fields, window, cx),
         Some(WitUiNode::Text(n)) => render_text(n, cx),
         Some(WitUiNode::Svg(n)) => render_svg(n, cx),
         Some(WitUiNode::Img(n)) => render_img(n, on_event, cx),
-        Some(WitUiNode::Input(n)) => render_input(n, on_event, cx),
+        Some(WitUiNode::Input(n)) => render_input(n, text_input_fields, cx),
         Some(WitUiNode::UniformList(n)) => render_uniform_list(n, on_event, focus_handles, window, cx),
     }
 }
@@ -138,6 +83,7 @@ fn render_div(
     node_idx: u32,
     on_event: &(impl Fn(String, WitUiEvent, &mut Window, &mut App) + Clone + 'static),
     focus_handles: &Arc<Mutex<std::collections::HashMap<u32, FocusHandle>>>,
+    text_input_fields: &std::collections::HashMap<String, Entity<InputField>>,
     window: &mut Window,
     cx: &App,
 ) -> AnyElement {
@@ -151,7 +97,7 @@ fn render_div(
     apply_style(&mut element, &n.style, cx);
 
     for &child_idx in &n.children {
-        element = element.child(render_node(nodes, child_idx, on_event, focus_handles, window, cx));
+        element = element.child(render_node(nodes, child_idx, on_event, focus_handles, text_input_fields, window, cx));
     }
 
     // Handle click and double-click with the same handler
@@ -406,248 +352,52 @@ fn render_text(n: &WitTextNode, cx: &App) -> AnyElement {
 
 fn render_input(
     n: &WitInputNode,
-    on_event: &(impl Fn(String, WitUiEvent, &mut Window, &mut App) + Clone + 'static),
+    text_input_fields: &std::collections::HashMap<String, Entity<InputField>>,
     cx: &App,
 ) -> AnyElement {
     let input_id = n.id.clone();
-    let current_value = n.value.clone();
-    let state = get_input_state(&input_id);
 
+    // If we have an InputField entity for this input, render it (real focus/IME/clipboard!)
+    if let Some(input_field) = text_input_fields.get(&input_id) {
+        // Don't wrap in div - render InputField directly with style applied as flex container
+        let mut element = div()
+            .id(ElementId::Name(input_id.into()));
+        apply_style(&mut element, &n.style, cx);
+        // Ensure the wrapper doesn't block input events
+        return element
+            .flex()
+            .child(input_field.clone())
+            .into_any_element();
+    }
+
+    // Fallback: simple placeholder text if InputField not created yet
     let mut element = div()
-        .id(ElementId::Name(input_id.clone().into()))
+        .id(ElementId::Name(input_id.into()))
         .cursor(CursorStyle::IBeam)
-        .relative()
         .flex()
         .items_center();
 
     apply_style(&mut element, &n.style, cx);
 
-    let display_text = if current_value.is_empty() {
+    let display_text = if n.value.is_empty() {
         n.placeholder.clone().unwrap_or_default()
     } else {
-        current_value.clone()
+        n.value.clone()
     };
 
-    let is_empty = current_value.is_empty();
+    let is_empty = n.value.is_empty();
     let text_color = if is_empty {
         cx.theme().colors().text_placeholder
     } else {
         cx.theme().colors().text
     };
 
-    let cb_for_click = on_event.clone();
-    let cb_for_keys = on_event.clone();
-    let input_id_for_click = input_id.clone();
-    let current_value_for_keys = current_value.clone();
-
-    element = element
-        .on_click(move |_, window, cx| {
-            cb_for_click(input_id_for_click.clone(), WitUiEvent::FocusGained, window, cx);
-        })
-        .on_key_down(move |event, window, cx| {
-            let mut state = get_input_state(&input_id);
-            let mut new_value = current_value_for_keys.clone();
-            let shift = event.keystroke.modifiers.shift;
-            let ctrl_or_cmd = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
-
-            match event.keystroke.key.as_str() {
-                "backspace" => {
-                    if !state.selected_range.is_empty() {
-                        new_value.replace_range(state.selected_range.clone(), "");
-                        let cursor_pos = state.selected_range.start;
-                        state.selected_range = cursor_pos..cursor_pos;
-                        state.selection_reversed = false;
-                    } else if cursor_offset(&state) > 0 {
-                        let prev = previous_boundary(&new_value, cursor_offset(&state));
-                        new_value.replace_range(prev..cursor_offset(&state), "");
-                        state.selected_range = prev..prev;
-                        state.selection_reversed = false;
-                    }
-                    set_input_state(input_id.clone(), state);
-                    cb_for_keys(input_id.clone(), WitUiEvent::InputChanged(new_value), window, cx);
-                }
-                "delete" => {
-                    if !state.selected_range.is_empty() {
-                        new_value.replace_range(state.selected_range.clone(), "");
-                        let cursor_pos = state.selected_range.start;
-                        state.selected_range = cursor_pos..cursor_pos;
-                        state.selection_reversed = false;
-                    } else if cursor_offset(&state) < new_value.len() {
-                        let next = next_boundary(&new_value, cursor_offset(&state));
-                        new_value.replace_range(cursor_offset(&state)..next, "");
-                    }
-                    set_input_state(input_id.clone(), state);
-                    cb_for_keys(input_id.clone(), WitUiEvent::InputChanged(new_value), window, cx);
-                }
-                "left" => {
-                    if shift {
-                        let new_pos = previous_boundary(&new_value, cursor_offset(&state));
-                        if state.selection_reversed {
-                            state.selected_range.start = new_pos;
-                        } else {
-                            state.selected_range.end = new_pos;
-                        }
-                        if state.selected_range.end < state.selected_range.start {
-                            state.selection_reversed = !state.selection_reversed;
-                            state.selected_range = state.selected_range.end..state.selected_range.start;
-                        }
-                    } else {
-                        let new_pos = if state.selected_range.is_empty() {
-                            previous_boundary(&new_value, cursor_offset(&state))
-                        } else {
-                            state.selected_range.start
-                        };
-                        state.selected_range = new_pos..new_pos;
-                        state.selection_reversed = false;
-                    }
-                    set_input_state(input_id.clone(), state);
-                }
-                "right" => {
-                    if shift {
-                        let new_pos = next_boundary(&new_value, cursor_offset(&state));
-                        if state.selection_reversed {
-                            state.selected_range.start = new_pos;
-                        } else {
-                            state.selected_range.end = new_pos;
-                        }
-                        if state.selected_range.end < state.selected_range.start {
-                            state.selection_reversed = !state.selection_reversed;
-                            state.selected_range = state.selected_range.end..state.selected_range.start;
-                        }
-                    } else {
-                        let new_pos = if state.selected_range.is_empty() {
-                            next_boundary(&new_value, cursor_offset(&state))
-                        } else {
-                            state.selected_range.end
-                        };
-                        state.selected_range = new_pos..new_pos;
-                        state.selection_reversed = false;
-                    }
-                    set_input_state(input_id.clone(), state);
-                }
-                "home" => {
-                    if shift {
-                        if state.selection_reversed {
-                            state.selected_range.start = 0;
-                        } else {
-                            state.selected_range.end = 0;
-                        }
-                        if state.selected_range.end < state.selected_range.start {
-                            state.selection_reversed = !state.selection_reversed;
-                            state.selected_range = state.selected_range.end..state.selected_range.start;
-                        }
-                    } else {
-                        state.selected_range = 0..0;
-                        state.selection_reversed = false;
-                    }
-                    set_input_state(input_id.clone(), state);
-                }
-                "end" => {
-                    let end_pos = new_value.len();
-                    if shift {
-                        if state.selection_reversed {
-                            state.selected_range.start = end_pos;
-                        } else {
-                            state.selected_range.end = end_pos;
-                        }
-                        if state.selected_range.end < state.selected_range.start {
-                            state.selection_reversed = !state.selection_reversed;
-                            state.selected_range = state.selected_range.end..state.selected_range.start;
-                        }
-                    } else {
-                        state.selected_range = end_pos..end_pos;
-                        state.selection_reversed = false;
-                    }
-                    set_input_state(input_id.clone(), state);
-                }
-                "a" if ctrl_or_cmd => {
-                    state.selected_range = 0..new_value.len();
-                    state.selection_reversed = false;
-                    set_input_state(input_id.clone(), state);
-                }
-                "enter" | "return" => {
-                    cb_for_keys(input_id.clone(), WitUiEvent::KeyDown(wit::since_v0_9_0::gui::KeyEventData {
-                        key: "enter".to_string(),
-                        shift: event.keystroke.modifiers.shift,
-                        ctrl: event.keystroke.modifiers.control,
-                        alt: event.keystroke.modifiers.alt,
-                        meta: event.keystroke.modifiers.platform,
-                        repeat: false,
-                    }), window, cx);
-                }
-                key if key.len() == 1 && !event.keystroke.modifiers.control && !event.keystroke.modifiers.platform => {
-                    if !state.selected_range.is_empty() {
-                        new_value.replace_range(state.selected_range.clone(), key);
-                        let cursor_pos = state.selected_range.start + key.len();
-                        state.selected_range = cursor_pos..cursor_pos;
-                        state.selection_reversed = false;
-                    } else {
-                        let cursor_pos = cursor_offset(&state);
-                        new_value.insert_str(cursor_pos, key);
-                        let new_cursor = cursor_pos + key.len();
-                        state.selected_range = new_cursor..new_cursor;
-                        state.selection_reversed = false;
-                    }
-                    set_input_state(input_id.clone(), state);
-                    cb_for_keys(input_id.clone(), WitUiEvent::InputChanged(new_value), window, cx);
-                }
-                _ => {}
-            }
-        });
-
-    // Render text with selection highlight
-    let has_selection = !state.selected_range.is_empty();
-
-    if has_selection && !is_empty {
-        let before_selection = &current_value[0..state.selected_range.start];
-        let selected_text = &current_value[state.selected_range.clone()];
-        let after_selection = &current_value[state.selected_range.end..];
-
-        element = element.child(
-            div()
-                .flex()
-                .items_center()
-                .when(!before_selection.is_empty(), |el| {
-                    el.child(
-                        div()
-                            .text_color(text_color)
-                            .child(SharedString::from(before_selection.to_string()))
-                    )
-                })
-                .child(
-                    div()
-                        .bg(cx.theme().colors().element_selected)
-                        .text_color(text_color)
-                        .child(SharedString::from(selected_text.to_string()))
-                )
-                .when(!after_selection.is_empty(), |el| {
-                    el.child(
-                        div()
-                            .text_color(text_color)
-                            .child(SharedString::from(after_selection.to_string()))
-                    )
-                })
-        );
-    } else {
-        element = element.child(
-            div()
-                .text_color(text_color)
-                .child(SharedString::from(display_text))
-        );
-
-        if !n.disabled && !has_selection {
-            element = element.child(
-                div()
-                    .w(px(2.0))
-                    .h_full()
-                    .bg(cx.theme().colors().text_accent)
-                    .ml(px(2.0))
-            );
-        }
-    }
-
-    element.into_any_element()
+    element
+        .text_color(text_color)
+        .child(display_text)
+        .into_any_element()
 }
+
 
 fn render_svg(n: &WitSvgNode, cx: &App) -> AnyElement {
     let mut element = div();

@@ -6118,7 +6118,7 @@ dependencies = [
  "settings",
  "theme",
  "ui",
- "unicode-segmentation",
+ "ui_input",
  "util",
  "workspace",
 ]

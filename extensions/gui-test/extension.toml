@@ -1,7 +1,7 @@
 id = "gui-test"
 name = "GUI Test"
 description = "A test extension that renders a simple GUI panel."
-version = "0.1.0"
+version = "0.1.2"
 schema_version = 1
 authors = ["Zed Dev <dev@zed.dev>"]
 repository = "https://github.com/zed-industries/zed"

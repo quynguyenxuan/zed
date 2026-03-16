@@ -136,6 +136,8 @@ Other entities can then register a callback to handle these events by doing `cx.
 ## Build guidelines
 
 - Use `./script/clippy` instead of `cargo clippy`
+- All Rust build artifacts are output to the `target/` directory (Rust default)
+- Extension build artifacts (WASM, tar.gz archives, manifest.json) are output to `extensions/<extension-name>/target/`
 
 ## Building Extensions
 
@@ -155,7 +157,7 @@ cargo build --package extension_cli --profile release-fast
 ```bash
 cargo run --package extension_cli --profile release-fast -- \
   --source-dir extensions/extension-name \
-  --output-dir extensions/extension-name/ \
+  --output-dir extensions/extension-name/target/ \
   --scratch-dir extensions/extension-name/scratch
 ```
 
@@ -163,7 +165,7 @@ cargo run --package extension_cli --profile release-fast -- \
 - Must have `[workspace]` table (empty) to prevent workspace conflicts
 - Must have `crate-type = ["cdylib"]` in `[lib]` section
 
-**Output artifacts:**
+**Output artifacts (in `extensions/<extension-name>/target/`):**
 - `archive.tar.gz` - Contains `extension.wasm` and `extension.toml`
 - `manifest.json` - Extension metadata
 
@@ -221,9 +223,7 @@ Rules emerge from validated patterns, not one-off observations. The workflow is:
 
 # Agent Instructions
 
-See [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md) for full instructions.
-
-This file exists for compatibility with tools that look for AGENTS.md.
+This file serves as the primary agent instructions for the Zed project.
 
 ## Key Sections
 
@@ -239,7 +239,7 @@ This file exists for compatibility with tools that look for AGENTS.md.
 - Status: `○ ◐ ● ✓ ❄`
 - Priority: `● P0` (filled circle with color)
 
-See [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md) for full development guidelines.
+See the sections above for full development guidelines.
 
 ## Agent Warning: Interactive Commands
 

@@ -7,13 +7,14 @@ use anyhow::Result;
 use command_palette_hooks::{DynamicCommand, GlobalDynamicCommandRegistry};
 use extension_host::{
     ExtensionManifest, ExtensionStore,
-    wasm_host::{ExtensionEventBus, PubSubEvent, QueryDelivery, QueryResponse, WasmExtension, wit, GuiPanelMessage},
+    wasm_host::{ExtensionEventBus, PubSubEvent, QueryDelivery, QueryResponse, WasmExtension, wit},
 };
 use futures::StreamExt;
 use gpui::{
-    Action, App, AsyncWindowContext, Context, EventEmitter, FocusHandle, Focusable,
+    Action, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
     IntoElement, Pixels, Render, Rgba, SharedString, WeakEntity, Window, actions, px,
 };
+use ui_input::{ErasedEditorEvent, InputField};
 use theme::ActiveTheme as _;
 use project::{self, Project};
 use serde::{Deserialize, Serialize};
@@ -21,7 +22,7 @@ use settings::SettingsStore;
 use ui::{IconName, prelude::*};
 use util::ResultExt as _;
 use workspace::{
-    Event as WorkspaceEvent, OpenOptions, Pane, ToggleZoom, Workspace,
+    OpenOptions, Pane, ToggleZoom, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
     item::{Item, ItemEvent},
 };
@@ -99,9 +100,14 @@ pub struct ExtensionGuiView {
     wasm: WasmExtension,
     workspace: WeakEntity<Workspace>,
     ui_tree: Option<wit::since_v0_9_0::ui_elements::UiTree>,
-    message_rx: Arc<Mutex<std::sync::mpsc::Receiver<GuiPanelMessage>>>,
     /// Maps WIT focus handle IDs to GPUI FocusHandles
     focus_handles: Arc<Mutex<std::collections::HashMap<u32, FocusHandle>>>,
+    /// Maps input IDs to InputField entities for real focus/IME/clipboard support
+    text_input_fields: std::collections::HashMap<String, Entity<InputField>>,
+    /// Subscriptions observing each InputField for text changes (fires InputChanged → WASM)
+    input_subscriptions: std::collections::HashMap<String, gpui::Subscription>,
+    /// Keep subscriptions alive for the lifetime of the view
+    _subscriptions: Vec<gpui::Subscription>,
 }
 
 impl ExtensionGuiView {
@@ -111,10 +117,6 @@ impl ExtensionGuiView {
         workspace: WeakEntity<Workspace>,
         cx: &mut Context<Self>,
     ) -> Self {
-        // Create synchronous channel for GUI panel messages
-        let (tx, rx) = std::sync::mpsc::channel();
-        let message_rx = Arc::new(Mutex::new(rx));
-
         // Create async channel for command execution requests
         let (cmd_tx, mut cmd_rx) = futures::channel::mpsc::unbounded();
 
@@ -285,11 +287,24 @@ impl ExtensionGuiView {
                     data: event.data,
                 };
                 wasm_for_delivery.call_on_pub_sub_event(wit_event).await.log_err();
+                // Re-render after pub-sub event, but only if tree changes
                 match wasm_for_delivery.call_gui_render().await {
-                    Ok(tree) => {
+                    Ok(new_tree) => {
                         this.update(cx, |view, cx| {
-                            view.ui_tree = Some(tree);
-                            cx.notify();
+                            // Only notify if tree actually changed (avoid infinite loop)
+                            let tree_changed = match &view.ui_tree {
+                                Some(old_tree) => {
+                                    old_tree.nodes.len() != new_tree.nodes.len() ||
+                                        old_tree.root != new_tree.root
+                                }
+                                None => true
+                            };
+
+                            view.ui_tree = Some(new_tree);
+
+                            if tree_changed {
+                                cx.notify();
+                            }
                         })
                         .log_err();
                     }
@@ -313,24 +328,34 @@ impl ExtensionGuiView {
         })
         .detach();
 
+        // Subscribe to ext.open-file events and emit ExtensionViewEvent::OpenFile
+        let (open_file_tx, open_file_rx) = futures::channel::mpsc::unbounded::<PubSubEvent>();
+        let open_file_subscription_id = cx.default_global::<ExtensionEventBus>()
+            .subscribe("ext.open-file".to_string(), open_file_tx);
+        cx.spawn(async move |this, cx| {
+            let mut rx = open_file_rx;
+            while let Some(event) = rx.next().await {
+                let path = std::path::PathBuf::from(event.data);
+                this.update(cx, |_view, cx| {
+                    cx.emit(ExtensionViewEvent::OpenFile(path));
+                })
+                .ok();
+            }
+        })
+        .detach();
+
         // Observe settings store to re-deliver theme whenever it changes.
-        cx.observe_global::<SettingsStore>(|this, cx| {
+        let settings_subscription = cx.observe_global::<SettingsStore>(|this, cx| {
             let theme = current_wit_theme(cx);
             let wasm = this.wasm.clone();
             cx.spawn(async move |_, _| {
                 wasm.call_gui_on_theme_change(theme).await.log_err();
             })
             .detach();
-        })
-        .detach();
+        });
 
         let wasm_for_init = wasm.clone();
         cx.spawn(async move |this, cx| {
-            // Set up message channel
-            if let Err(err) = wasm_for_init.inject_gui_panel_tx(tx).await {
-                log::error!("inject_gui_panel_tx failed: {err}");
-            }
-
             // Set up command execution channel
             if let Err(err) = wasm_for_init.inject_command_execution_tx(cmd_tx).await {
                 log::error!("inject_command_execution_tx failed: {err}");
@@ -436,8 +461,79 @@ impl ExtensionGuiView {
             wasm,
             workspace,
             ui_tree: None,
-            message_rx,
             focus_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            text_input_fields: std::collections::HashMap::new(),
+            input_subscriptions: std::collections::HashMap::new(),
+            _subscriptions: vec![settings_subscription],
+        }
+    }
+
+    /// Ensure InputField entities exist for all input nodes in the tree.
+    /// Called from render() to lazily create InputFields as needed.
+    /// IMPORTANT: Only creates new fields, does NOT update existing ones to avoid notify loops.
+    fn ensure_text_input_fields(&mut self, tree: &wit::since_v0_9_0::ui_elements::UiTree, window: &mut Window, cx: &mut Context<Self>) {
+        use wit::since_v0_9_0::ui_elements::UiNode;
+
+        // Collect all input IDs in current tree
+        let mut current_input_ids = std::collections::HashSet::new();
+        for node in &tree.nodes {
+            if let UiNode::Input(input_node) = node {
+                current_input_ids.insert(input_node.id.clone());
+            }
+        }
+
+        // Remove InputFields and their subscriptions for inputs no longer in the tree
+        self.input_subscriptions.retain(|id, _| current_input_ids.contains(id));
+        self.text_input_fields.retain(|id, _| current_input_ids.contains(id));
+
+        for node in &tree.nodes {
+            if let UiNode::Input(input_node) = node {
+                let input_id = input_node.id.clone();
+
+                // Only create if doesn't exist - do NOT update existing fields here
+                // (updating would trigger notify → re-render → infinite loop)
+                if !self.text_input_fields.contains_key(&input_id) {
+                    let placeholder = input_node.placeholder.clone().unwrap_or_default();
+                    let input_field = cx.new(|cx| InputField::new(window, cx, &placeholder));
+
+                    // Subscribe to the underlying editor's BufferEdited event:
+                    // fires on every keystroke → sends InputChanged to WASM
+                    let editor = input_field.read(cx).editor().clone();
+                    let wasm = self.wasm.clone();
+                    let entity_weak = cx.entity().downgrade();
+                    let source_id = input_id.clone();
+                    let editor_for_text = editor.clone();
+                    let subscription = editor.subscribe(Box::new(move |event, _window, cx| {
+                        if event != ErasedEditorEvent::BufferEdited {
+                            return;
+                        }
+                        let text = editor_for_text.text(cx);
+                        let wasm = wasm.clone();
+                        let entity_weak = entity_weak.clone();
+                        let source_id = source_id.clone();
+                        cx.spawn(async move |cx| {
+                            let ui_event = wit::since_v0_9_0::gui::UiEvent::InputChanged(text);
+                            wasm.call_gui_on_event(source_id, ui_event).await.log_err();
+                            match wasm.call_gui_render().await {
+                                Ok(new_tree) => {
+                                    entity_weak
+                                        .update(cx, |view, cx| {
+                                            view.ensure_focus_handles(&new_tree, cx);
+                                            view.ui_tree = Some(new_tree);
+                                            cx.notify();  // Always notify after InputChanged - content/styles may have changed
+                                        })
+                                        .log_err();
+                                }
+                                Err(err) => log::error!("gui_render failed after InputChanged: {err}"),
+                            }
+                        })
+                        .detach();
+                    }), window, cx);
+
+                    self.input_subscriptions.insert(input_id.clone(), subscription);
+                    self.text_input_fields.insert(input_id, input_field);
+                }
+            }
         }
     }
 
@@ -457,38 +553,6 @@ impl ExtensionGuiView {
             }
         }
     }
-
-    fn process_pending_messages(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Process all pending messages without blocking
-        if let Ok(rx) = self.message_rx.lock() {
-            while let Ok(msg) = rx.try_recv() {
-                match msg {
-                    GuiPanelMessage::RequestFocus(handle_id) => {
-                        // Focus the element with the given handle ID
-                        if let Ok(handles) = self.focus_handles.lock() {
-                            if let Some(focus_handle) = handles.get(&handle_id) {
-                                window.focus(focus_handle, cx);
-                            }
-                        }
-                    }
-                    GuiPanelMessage::Call { method, params, .. } => {
-                        if method == "open_file" {
-                            #[derive(Deserialize)]
-                            struct OpenFileParams {
-                                path: String,
-                            }
-
-                            if let Ok(data) = serde_json::from_str::<OpenFileParams>(&params) {
-                                let path = PathBuf::from(data.path);
-                                cx.emit(ExtensionViewEvent::OpenFile(path));
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
 }
 
 impl Focusable for ExtensionGuiView {
@@ -502,9 +566,6 @@ impl EventEmitter<ExtensionViewEvent> for ExtensionGuiView {}
 
 impl Render for ExtensionGuiView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Process any pending messages and emit events
-        self.process_pending_messages(window, cx);
-
         let wasm = self.wasm.clone();
         let entity = cx.entity().downgrade();
         let on_event = move |source_id: String,
@@ -516,11 +577,25 @@ impl Render for ExtensionGuiView {
             cx.spawn(async move |cx| {
                 wasm.call_gui_on_event(source_id, event).await.log_err();
                 match wasm.call_gui_render().await {
-                    Ok(tree) => {
+                    Ok(new_tree) => {
                         entity
                             .update(cx, |view, cx| {
-                                view.ui_tree = Some(tree);
-                                cx.notify();
+                                view.ensure_focus_handles(&new_tree, cx);
+
+                                // Only notify if tree actually changed
+                                let tree_changed = match &view.ui_tree {
+                                    Some(old_tree) => {
+                                        old_tree.nodes.len() != new_tree.nodes.len() ||
+                                            old_tree.root != new_tree.root
+                                    }
+                                    None => true
+                                };
+
+                                view.ui_tree = Some(new_tree);
+
+                                if tree_changed {
+                                    cx.notify();
+                                }
                             })
                             .log_err();
                     }
@@ -529,24 +604,29 @@ impl Render for ExtensionGuiView {
             })
             .detach();
         };
-        match &self.ui_tree {
-            Some(tree) => {
-                let tree = tree.clone();
 
-                // Create focus handles for any new focusable elements in the tree
-                self.ensure_focus_handles(&tree, cx);
+        let tree = self.ui_tree.clone();
+        match tree {
+            Some(ref tree) => {
+                self.ensure_text_input_fields(tree, window, cx);
+                self.ensure_focus_handles(tree, cx);
 
                 let focus_handles = self.focus_handles.clone();
+                let text_input_fields = &self.text_input_fields;
 
                 div()
+                    .track_focus(&self.focus_handle)
                     .size_full()
-                    .child(ui_renderer::render_ui_tree(&tree, on_event, focus_handles, window, cx))
+                    .child(ui_renderer::render_ui_tree(tree, on_event, focus_handles, text_input_fields, window, cx))
                     .into_any_element()
             }
-            None => div()
-                .size_full()
-                .child(Label::new("Loading…"))
-                .into_any_element(),
+            None => {
+                div()
+                    .track_focus(&self.focus_handle)
+                    .size_full()
+                    .child(Label::new("Loading…"))
+                    .into_any_element()
+            }
         }
     }
 }
@@ -584,7 +664,8 @@ impl ExtensionGuiPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let pane = new_extension_pane(workspace.clone(), project, window, cx);
+        let panel = cx.weak_entity();
+        let pane = new_extension_pane(workspace.clone(), project, panel, window, cx);
         Self {
             active_pane: pane,
             workspace,
@@ -643,6 +724,7 @@ impl ExtensionGuiPanel {
 fn new_extension_pane(
     workspace: WeakEntity<Workspace>,
     project: gpui::Entity<Project>,
+    panel: WeakEntity<ExtensionGuiPanel>,
     window: &mut Window,
     cx: &mut Context<ExtensionGuiPanel>,
 ) -> gpui::Entity<Pane> {
@@ -661,21 +743,39 @@ fn new_extension_pane(
         pane.display_nav_history_buttons(None);
         pane.set_should_display_tab_bar(|_, _| true);
         pane.set_zoom_out_on_close(false);
+        // Disable pane-level zoom so ToggleZoom action propagates rather than emitting
+        // pane::Event::ZoomIn/ZoomOut (which the workspace ignores for non-workspace panes).
+        pane.set_can_toggle_zoom(false, cx);
 
-        // Custom tab bar buttons: only show zoom button when focused
-        pane.set_render_tab_bar_buttons(cx, |pane, window, cx| {
-            // Only show buttons when pane has focus
+        // Custom tab bar buttons: emit PanelEvent::ZoomIn/ZoomOut on the panel so the
+        // dock correctly updates workspace.zoomed.
+        pane.set_render_tab_bar_buttons(cx, move |pane, window, cx| {
             if !pane.has_focus(window, cx) && !pane.context_menu_focused(window, cx) {
                 return (None, None);
             }
 
+            // Use pane param directly — reading active_pane through the entity map here
+            // would panic (double-borrow while pane is being rendered).
             let zoomed = pane.is_zoomed();
+
+            let panel = panel.clone();
             let zoom_button = ui::IconButton::new("toggle_zoom", ui::IconName::Maximize)
                 .icon_size(ui::IconSize::Small)
                 .toggle_state(zoomed)
                 .selected_icon(ui::IconName::Minimize)
-                .on_click(cx.listener(|pane, _, window, cx| {
-                    pane.toggle_zoom(&ToggleZoom, window, cx);
+                .on_click(cx.listener(move |pane, _, _window, cx| {
+                    // Set zoom state directly on the pane param (already mutably borrowed).
+                    // Then emit PanelEvent on the panel entity so the dock updates workspace.zoomed.
+                    let new_zoomed = !pane.is_zoomed();
+                    pane.set_zoomed(new_zoomed, cx);
+                    panel.update(cx, |_panel, cx| {
+                        if new_zoomed {
+                            cx.emit(PanelEvent::ZoomIn);
+                        } else {
+                            cx.emit(PanelEvent::ZoomOut);
+                        }
+                    })
+                    .ok();
                 }))
                 .tooltip(move |_window, cx| {
                     ui::Tooltip::for_action(
@@ -843,8 +943,10 @@ pub fn init(cx: &mut App) {
 
             let Some(window) = window else { return };
 
+            // DEBUGGING: Disable workspace subscription to isolate loop source
             // Push workspace change events to the extension event bus so that
             // extensions relying on the pub-sub cache get zero-latency reads.
+            /*
             let workspace_entity = cx.entity();
             cx.subscribe_in(
                 &workspace_entity,
@@ -896,6 +998,7 @@ pub fn init(cx: &mut App) {
                 },
             )
             .detach();
+            */
 
             let extension_store = ExtensionStore::global(cx);
             cx.subscribe_in(

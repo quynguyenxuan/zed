@@ -911,13 +911,14 @@ impl WasmHost {
             store.set_epoch_deadline(1);
             store.epoch_deadline_async_yield_and_update(1);
 
+            let has_gui = manifest.panel_ui.is_some();
             let mut extension = Extension::instantiate_async(
                 &executor,
                 &mut store,
                 this.release_channel,
                 zed_api_version.clone(),
                 &component,
-                manifest.panel_ui.is_some(),
+                has_gui,
             )
             .await?;
 

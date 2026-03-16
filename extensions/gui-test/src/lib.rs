@@ -245,7 +245,9 @@ impl Extension for GitPanel {
             }
             "commit-input" => {
                 if let zed::gui::UiEvent::InputChanged(new_value) = event {
+                    eprintln!("[gui-test v0.1.2] InputChanged event received: '{}'", new_value);
                     self.commit_message = new_value;
+                    eprintln!("[gui-test v0.1.2] Updated commit_message to: '{}'", self.commit_message);
                 }
                 return;
             }
@@ -440,6 +442,14 @@ impl Extension for GitPanel {
         let mut root = v_flex()
             .size_full()
             .overflow_y_scroll()
+            // ── Extension version ────────────────────────────────────────
+            .child(
+                h_flex()
+                    .px_3()
+                    .py_1()
+                    .justify_end()
+                    .child(Label::new("v0.1.2").muted().text_xs()),
+            )
             // ── Repository header ────────────────────────────────────────
             .child(
                 h_flex()
@@ -654,8 +664,7 @@ impl Extension for GitPanel {
                             .border_1()
                             .border_color(ui::color_border())
                             .bg(ui::color_surface())
-                            .text_sm()
-                            .on_input(|_| {}),
+                            .text_sm(),
                     )
                     // Quick-fill preset row
                     .child(
@@ -722,7 +731,9 @@ impl Extension for GitPanel {
                     ),
             );
 
-        ui::render_tree(root)
+        let tree = ui::render_tree(root);
+        eprintln!("[gui-test] gui_render: Ready -> tree nodes={} root={}", tree.nodes.len(), tree.root);
+        tree
     }
 
     fn run_extension_command(&mut self, command_id: &str) -> Result<(), String> {

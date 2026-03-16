@@ -326,7 +326,26 @@ impl ExtensionStore {
                     .mtime
                     .bad_is_greater_than(extensions_metadata.mtime)
             {
-                extension_index_needs_rebuild = false;
+                // Check if there are any new extensions not in the index
+                let has_new_extensions = cx.foreground_executor().block_on(async {
+                    if let Ok(mut extension_paths) = this.fs.read_dir(&this.installed_dir).await {
+                        while let Some(Ok(entry)) = extension_paths.next().await {
+                            if let Some(name) = entry.file_name() {
+                                let name_str = name.to_string_lossy();
+                                if name_str != ".DS_Store"
+                                    && !extension_index.extensions.contains_key(name_str.as_ref())
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    false
+                });
+
+                if !has_new_extensions {
+                    extension_index_needs_rebuild = false;
+                }
             }
         }
 
